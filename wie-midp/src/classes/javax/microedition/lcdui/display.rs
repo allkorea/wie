@@ -1078,6 +1078,7 @@ impl Display {
                 .invoke_virtual(&current, "javax/microedition/lcdui/Displayable", "decorationChanged", "()V", ())
                 .await?;
         } else {
+            jvm.put_field(&mut this, "repaintPending", "Z", true).await?;
             let platform = context.system().platform();
             platform.screen().request_redraw().unwrap();
         }
