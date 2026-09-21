@@ -69,7 +69,7 @@ impl FrameBuffer {
         }))
     }
 
-    fn layout(&self, context: &dyn WIPICContext) -> Result<(u32, u32, u32)> {
+    pub(super) fn layout(&self, context: &dyn WIPICContext) -> Result<(u32, u32, u32)> {
         if !matches!(self.0.bpp, 16 | 32) {
             return Err(WieError::FatalError(format!("Unsupported pixel format: {}", self.0.bpp)));
         }
@@ -89,13 +89,13 @@ impl FrameBuffer {
         Ok((address, size, row_bytes))
     }
 
-    fn data<T: Pod>(&self, context: &dyn WIPICContext) -> Result<Vec<T>> {
-        let (address, _, row_bytes) = self.layout(context)?;
-        let size = row_bytes as usize * self.0.height as usize;
-        let mut buf = vec![T::zeroed(); size / size_of::<T>()];
+    fn data<T: Pod>(&self, context: &dyn WIPICContext, x: u32, y: u32, width: u32, height: u32) -> Result<Vec<T>> {
+        let (address, _, _) = self.layout(context)?;
+        let row_bytes = width as usize * size_of::<T>();
+        let mut buf = vec![T::zeroed(); width as usize * height as usize];
         if row_bytes != 0 {
-            for (y, row) in cast_slice_mut(&mut buf).chunks_mut(row_bytes as usize).enumerate() {
-                let address = address + y as u32 * self.0.bpl;
+            for (row_index, row) in cast_slice_mut(&mut buf).chunks_mut(row_bytes).enumerate() {
+                let address = address + (y + row_index as u32) * self.0.bpl + x * size_of::<T>() as u32;
                 if context.read_bytes(address, row)? != row.len() {
                     return Err(WieError::InvalidMemoryAccess(address));
                 }
@@ -105,17 +105,16 @@ impl FrameBuffer {
     }
 
     pub fn image(&self, context: &mut dyn WIPICContext) -> Result<Box<dyn Image>> {
+        self.image_region(context, 0, 0, self.0.width, self.0.height)
+    }
+
+    pub(super) fn image_region(&self, context: &dyn WIPICContext, x: u32, y: u32, width: u32, height: u32) -> Result<Box<dyn Image>> {
+        if x > self.0.width || width > self.0.width - x || y > self.0.height || height > self.0.height - y {
+            return Err(WieError::AllocationFailure);
+        }
         Ok(match self.0.bpp {
-            16 => Box::new(VecImageBuffer::<Rgb565Pixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                self.data(context)?,
-            )),
-            32 => Box::new(VecImageBuffer::<ArgbPixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                self.data(context)?,
-            )),
+            16 => Box::new(VecImageBuffer::<Rgb565Pixel>::from_raw(width, height, self.data(context, x, y, width, height)?)),
+            32 => Box::new(VecImageBuffer::<ArgbPixel>::from_raw(width, height, self.data(context, x, y, width, height)?)),
             _ => return Err(WieError::FatalError(format!("Unsupported pixel format: {}", self.0.bpp))),
         })
     }
