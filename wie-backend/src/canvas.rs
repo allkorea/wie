@@ -52,6 +52,19 @@ pub trait Image: Send {
     fn get_pixel(&self, x: i32, y: i32) -> Color;
     fn raw(&self) -> Cow<'_, [u8]>;
     fn colors(&self) -> Vec<Color>;
+
+    /// Read a contiguous row span; the caller must keep the span inside the image.
+    fn read_colors(&self, x: u32, y: u32, colors: &mut [Color]) {
+        for (index, color) in colors.iter_mut().enumerate() {
+            *color = self.get_pixel((x + index as u32) as i32, y as i32);
+        }
+    }
+
+    /// Replace the caller-owned buffer with tightly packed RGBA bytes, retaining its capacity.
+    fn copy_rgba(&self, rgba: &mut Vec<u8>) {
+        rgba.clear();
+        rgba.extend(self.colors().into_iter().flat_map(|c| [c.r, c.g, c.b, c.a]));
+    }
 }
 
 pub trait ImageBuffer: Send {
@@ -274,6 +287,22 @@ where
     fn colors(&self) -> Vec<Color> {
         self.data.iter().map(|&x| T::to_color(x)).collect()
     }
+
+    fn read_colors(&self, x: u32, y: u32, colors: &mut [Color]) {
+        let start = y as usize * self.width as usize + x as usize;
+        let end = start + colors.len();
+        for (color, &raw) in colors.iter_mut().zip(&self.data[start..end]) {
+            *color = T::to_color(raw);
+        }
+    }
+
+    fn copy_rgba(&self, rgba: &mut Vec<u8>) {
+        rgba.clear();
+        rgba.extend(self.data.iter().flat_map(|&raw| {
+            let c = T::to_color(raw);
+            [c.r, c.g, c.b, c.a]
+        }));
+    }
 }
 
 impl<T> ImageBuffer for VecImageBuffer<T>
@@ -291,17 +320,25 @@ where
     }
 
     fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]) {
-        for (i, color) in colors.iter().enumerate() {
-            let x = x + (i as i32 % (width as i32));
-            let y = y + (i as i32 / (width as i32));
-
-            if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+        if width == 0 {
+            return;
+        }
+        for (row_index, row) in colors.chunks(width as usize).enumerate() {
+            let py = y as i64 + row_index as i64;
+            if py >= self.height as i64 {
+                break;
+            }
+            if py < 0 {
                 continue;
             }
-
-            let raw = T::from_color(*color);
-
-            self.data[((y as u32) * self.width + (x as u32)) as usize] = raw;
+            let start = (-(x as i64)).clamp(0, row.len() as i64) as usize;
+            let end = (self.width as i64 - x as i64).clamp(0, row.len() as i64) as usize;
+            if start < end {
+                let offset = py as usize * self.width as usize + (x as i64 + start as i64) as usize;
+                for (raw, &color) in self.data[offset..offset + end - start].iter_mut().zip(&row[start..end]) {
+                    *raw = T::from_color(color);
+                }
+            }
         }
     }
 
@@ -519,70 +556,70 @@ where
     fn copy_area(&mut self, dx: i32, dy: i32, sx: i32, sy: i32, w: u32, h: u32, clip: Clip) {
         let image_width = (self.image_buffer.width() as i64).min(i32::MAX as i64);
         let image_height = (self.image_buffer.height() as i64).min(i32::MAX as i64);
-
-        let x_start = (dx as i64).max(clip.x as i64).max(0);
-        let y_start = (dy as i64).max(clip.y as i64).max(0);
-        let x_end = (dx as i64 + w as i64).min(clip.x as i64 + clip.width as i64).min(image_width);
-        let y_end = (dy as i64 + h as i64).min(clip.y as i64 + clip.height as i64).min(image_height);
-
+        let shift_x = dx as i64 - sx as i64;
+        let shift_y = dy as i64 - sy as i64;
+        let x_start = (dx as i64).max(clip.x as i64).max(0).max(shift_x);
+        let y_start = (dy as i64).max(clip.y as i64).max(0).max(shift_y);
+        let x_end = (dx as i64 + w as i64)
+            .min(clip.x as i64 + clip.width as i64)
+            .min(image_width)
+            .min(image_width + shift_x);
+        let y_end = (dy as i64 + h as i64)
+            .min(clip.y as i64 + clip.height as i64)
+            .min(image_height)
+            .min(image_height + shift_y);
         if x_start >= x_end || y_start >= y_end {
             return;
         }
 
-        let mut pixels = Vec::with_capacity(((x_end - x_start) * (y_end - y_start)) as usize);
-        for y_dst in y_start..y_end {
-            for x_dst in x_start..x_end {
-                let x_src = sx as i64 + x_dst - dx as i64;
-                let y_src = sy as i64 + y_dst - dy as i64;
-
-                if x_src < 0 || y_src < 0 || x_src >= image_width || y_src >= image_height {
-                    continue;
-                }
-
-                pixels.push((x_dst as i32, y_dst as i32, self.image_buffer.get_pixel(x_src as i32, y_src as i32)));
+        // Copy away from the source. Each bounded chunk is snapshotted before writing,
+        // so both horizontal and vertical overlap retain memmove-like semantics.
+        let mut pixels = [Color { a: 0, r: 0, g: 0, b: 0 }; 256];
+        for row in 0..y_end - y_start {
+            let y = if dy > sy { y_end - 1 - row } else { y_start + row };
+            for offset in (0..x_end - x_start).step_by(pixels.len()) {
+                let len = (x_end - x_start - offset).min(pixels.len() as i64);
+                let x = if dx > sx { x_end - offset - len } else { x_start + offset };
+                self.image_buffer.read_colors((x - shift_x) as u32, (y - shift_y) as u32, &mut pixels[..len as usize]);
+                self.image_buffer.put_pixels(x as i32, y as i32, len as u32, &pixels[..len as usize]);
             }
-        }
-
-        for (x, y, color) in pixels {
-            self.image_buffer.put_pixel(x, y, color);
         }
     }
 
     fn draw(&mut self, dx: i32, dy: i32, w: u32, h: u32, src: &dyn Image, sx: i32, sy: i32, clip: Clip) {
-        // iterate only the overlap of destination, source, and image bounds; i64 keeps
-        // extreme guest offsets from overflowing or spinning through offscreen pixels
-        let x_start = 0i64.max(-(dx as i64)).max(-(sx as i64));
+        // Clip source, destination and guest clip before reading any source pixels.
+        let x_start = 0i64.max(-(dx as i64)).max(-(sx as i64)).max(clip.x as i64 - dx as i64);
         let x_end = (w as i64)
-            .min(self.image_buffer.width() as i64 - dx as i64)
-            .min(src.width() as i64 - sx as i64);
-        let y_start = 0i64.max(-(dy as i64)).max(-(sy as i64));
+            .min(self.image_buffer.width().min(i32::MAX as u32) as i64 - dx as i64)
+            .min(src.width().min(i32::MAX as u32) as i64 - sx as i64)
+            .min(clip.x as i64 + clip.width as i64 - dx as i64);
+        let y_start = 0i64.max(-(dy as i64)).max(-(sy as i64)).max(clip.y as i64 - dy as i64);
         let y_end = (h as i64)
-            .min(self.image_buffer.height() as i64 - dy as i64)
-            .min(src.height() as i64 - sy as i64);
-
+            .min(self.image_buffer.height().min(i32::MAX as u32) as i64 - dy as i64)
+            .min(src.height().min(i32::MAX as u32) as i64 - sy as i64)
+            .min(clip.y as i64 + clip.height as i64 - dy as i64);
         if x_start >= x_end || y_start >= y_end {
             return;
         }
 
-        let x_step = if dx > sx { -1 } else { 1 };
-        let y_step = if dy > sy { -1 } else { 1 };
-        let mut y = if y_step < 0 { y_end - 1 } else { y_start };
-        while y >= y_start && y < y_end {
-            let mut x = if x_step < 0 { x_end - 1 } else { x_start };
-            while x >= x_start && x < x_end {
+        let mut pixels = [Color { a: 0, r: 0, g: 0, b: 0 }; 256];
+        for row in 0..y_end - y_start {
+            let y = if dy > sy { y_end - 1 - row } else { y_start + row };
+            for offset in (0..x_end - x_start).step_by(pixels.len()) {
+                let len = (x_end - x_start - offset).min(pixels.len() as i64);
+                let x = if dx > sx { x_end - offset - len } else { x_start + offset };
+                let pixels = &mut pixels[..len as usize];
+                src.read_colors((sx as i64 + x) as u32, (sy as i64 + y) as u32, pixels);
                 let px = (dx as i64 + x) as i32;
                 let py = (dy as i64 + y) as i32;
-                if (px as i64) >= clip.x as i64
-                    && (px as i64) < clip.x as i64 + clip.width as i64
-                    && (py as i64) >= clip.y as i64
-                    && (py as i64) < clip.y as i64 + clip.height as i64
-                {
-                    self.blend_pixel(px, py, src.get_pixel((sx as i64 + x) as i32, (sy as i64 + y) as i32));
+                if !self.xor_mode && pixels.iter().all(|color| color.a == 255) {
+                    self.image_buffer.put_pixels(px, py, len as u32, pixels);
+                } else {
+                    for (column, &color) in pixels.iter().enumerate() {
+                        self.blend_pixel(px + column as i32, py, color);
+                    }
                 }
-
-                x += x_step;
             }
-            y += y_step;
         }
     }
 
@@ -643,8 +680,8 @@ where
             let h_advance = font.h_advance(glyph.id);
 
             if let Some(outlined_glyph) = font.outline_glyph(glyph) {
+                let bounds = outlined_glyph.px_bounds();
                 outlined_glyph.draw(|glyph_x: u32, glyph_y, c| {
-                    let bounds = outlined_glyph.px_bounds();
                     let px = x + (glyph_x as f32 + bounds.min.x + position) as i32;
                     let py = y + (glyph_y as f32 + bounds.min.y + size) as i32;
                     if px < clip.x || px >= clip.x + clip.width as i32 || py < clip.y || py >= clip.y + clip.height as i32 {
@@ -762,10 +799,26 @@ where
     }
 
     fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color, clip: Clip) {
-        // TODO use put_pixels
-        for py in clamp_span(y, h, self.image_buffer.height()) {
-            for px in clamp_span(x, w, self.image_buffer.width()) {
-                self.plot(px, py, color, &clip);
+        let area = Clip { x, y, width: w, height: h }.intersect(&clip).intersect(&Clip {
+            x: 0,
+            y: 0,
+            width: self.image_buffer.width().min(i32::MAX as u32),
+            height: self.image_buffer.height().min(i32::MAX as u32),
+        });
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let pixels = [color; 256];
+        for py in area.y..area.y + area.height as i32 {
+            if self.xor_mode {
+                for px in area.x..area.x + area.width as i32 {
+                    self.compose_pixel(px, py, color, false);
+                }
+            } else {
+                for offset in (0..area.width).step_by(pixels.len()) {
+                    let len = (area.width - offset).min(pixels.len() as u32);
+                    self.image_buffer.put_pixels(area.x + offset as i32, py, len, &pixels[..len as usize]);
+                }
             }
         }
     }
@@ -927,11 +980,8 @@ pub fn decode_image(data: &[u8]) -> Result<Box<dyn Image>> {
 pub fn encode_png(image: &dyn Image) -> Result<Vec<u8>> {
     extern crate std;
 
-    let rgba = image
-        .colors()
-        .into_iter()
-        .flat_map(|color| [color.r, color.g, color.b, color.a])
-        .collect::<Vec<_>>();
+    let mut rgba = Vec::new();
+    image.copy_rgba(&mut rgba);
     let mut encoded = Vec::new();
     PngEncoder::new(&mut encoded)
         .write_image(&rgba, image.width(), image.height(), ExtendedColorType::Rgba8)
@@ -980,6 +1030,15 @@ mod tests {
             assert_eq!(raw[i * 4 + 2], 0);
             assert_eq!(raw[i * 4 + 3], 255);
         }
+
+        let image = VecImageBuffer::<ArgbPixel>::from_raw(2, 1, vec![0x12345678, 0xabcdef01]);
+        let mut rgba = Vec::with_capacity(8);
+        let storage = rgba.as_ptr();
+        image.copy_rgba(&mut rgba);
+        assert_eq!(rgba, [0x34, 0x56, 0x78, 0x12, 0xcd, 0xef, 0x01, 0xab]);
+        image.copy_rgba(&mut rgba);
+        assert_eq!(rgba.len(), 8);
+        assert_eq!(rgba.as_ptr(), storage);
 
         Ok(())
     }
@@ -1159,6 +1218,27 @@ mod tests {
         assert_color(canvas.image(), 1, 0, red);
         assert_color(canvas.image(), 2, 0, green);
         assert_color(canvas.image(), 3, 0, blue);
+
+        for (dx, dy, sx, sy) in [(1, 1, 0, 0), (0, 0, 1, 1), (7, 0, 0, 0), (0, 0, 7, 0), (-2, 0, 0, -1)] {
+            let raw: Vec<_> = (0..520 * 3).map(|i| 0x80000000 | i as u32).collect();
+            let snapshot = VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw.clone());
+            let mut expected = VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw.clone());
+            let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw));
+            let clip = Clip { x: 3, y: 0, width: 513, height: 3 };
+            for y in 0..3 {
+                for x in 3..516 {
+                    let source_x = sx + x - dx;
+                    let source_y = sy + y - dy;
+                    if x >= dx && x < dx + 520 && y >= dy && y < dy + 3
+                        && (0..520).contains(&source_x) && (0..3).contains(&source_y)
+                    {
+                        expected.put_pixel(x, y, snapshot.get_pixel(source_x, source_y));
+                    }
+                }
+            }
+            canvas.copy_area(dx, dy, sx, sy, 520, 3, clip);
+            assert_eq!(&*canvas.image().raw(), &*expected.raw());
+        }
     }
 
     #[test]
