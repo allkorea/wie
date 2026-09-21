@@ -96,22 +96,26 @@ impl BucketAllocator {
 
     pub fn free(core: &mut ArmCore, base_address: u32, address: u32, size: u32) -> Result<()> {
         let bucket_index = Self::find_bucket_index(size);
-        let (slot_size, _) = BUCKETS[bucket_index];
+        let (slot_size, slot_count) = BUCKETS[bucket_index];
         let header_address = base_address + region_offset(bucket_index) as u32;
         let header_len = header_length(bucket_index);
 
-        let mut header = vec![0u8; header_len];
-        core.read_bytes(header_address, &mut header)?;
+        let offset = address
+            .checked_sub(header_address + header_len as u32)
+            .ok_or(WieError::InvalidMemoryAccess(address))?;
+        if offset % slot_size as u32 != 0 || offset / slot_size as u32 >= slot_count as u32 {
+            return Err(WieError::InvalidMemoryAccess(address));
+        }
 
-        let offset = (address - header_address - header_len as u32) / slot_size as u32;
-        let index = offset / 8;
-        let bit = offset % 8;
+        let slot = offset / slot_size as u32;
+        let index = slot / 8;
+        let bit = slot % 8;
+        let mut header = [0u8; 1];
+        core.read_bytes(header_address + index, &mut header)?;
 
-        debug_assert!(header[index as usize] & (1 << bit) == 0);
-
-        header[index as usize] |= 1 << bit;
-
-        core.write_bytes(header_address + index, &[header[index as usize]])?;
+        debug_assert!(header[0] & (1 << bit) == 0);
+        header[0] |= 1 << bit;
+        core.write_bytes(header_address + index, &header)?;
 
         Ok(())
     }
