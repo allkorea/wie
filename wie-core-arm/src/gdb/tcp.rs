@@ -36,10 +36,13 @@ impl GdbServer {
         listener.set_nonblocking(true)?;
         let target = GdbTarget::new(core);
         let debug = target.debug.clone();
+        let server_debug = debug.clone();
         let connection = Arc::new(Mutex::new(None));
         let server_connection = connection.clone();
         let thread = thread::Builder::new().spawn(move || {
-            if let Err(err) = target.run_gdb_server(listener, server_connection) {
+            let result = target.run_gdb_server(listener, server_connection);
+            server_debug.shutdown();
+            if let Err(err) = result {
                 tracing::error!("GDB server error: {err}");
             }
         })?;
@@ -91,6 +94,8 @@ impl GdbTarget {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
+            // Only accept is nonblocking; the GDB packet reader expects blocking I/O.
+            stream.set_nonblocking(false)?;
             {
                 let mut active = connection.lock();
                 if self.debug.is_stopped() {
@@ -407,7 +412,9 @@ mod tests {
             let runner = if mode >= 2 {
                 core.load(&[0x01, 0x30, 0xfd, 0xe7], 0x1000, 4).unwrap();
                 let mut running = core.clone();
-                let task = core.run_in_thread(move || async move { running.run_function::<()>(0x1001, &[0]).await }).unwrap();
+                let task = core
+                    .run_in_thread(move || async move { running.run_function::<()>(0x1001, &[0]).await })
+                    .unwrap();
                 Some(thread::spawn(move || task_tx.send(futures::executor::block_on(task)).unwrap()))
             } else {
                 None
@@ -428,6 +435,11 @@ mod tests {
                         Write::write_all(stream, b"$g").unwrap();
                     } else {
                         send_packet(stream, "vCont;c");
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while debug.read_registers().r0 == 0 {
+                            assert!(std::time::Instant::now() < deadline, "guest did not resume");
+                            thread::yield_now();
+                        }
                     }
                 }
             }
