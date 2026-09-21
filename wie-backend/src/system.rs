@@ -2,7 +2,7 @@ mod audio;
 mod event_queue;
 mod file_system;
 
-use alloc::{borrow::ToOwned, boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 
 use spin::{RwLock, RwLockWriteGuard};
 
@@ -25,8 +25,8 @@ pub use self::{
 
 #[derive(Clone)]
 pub struct System {
-    pid: String,
-    aid: String,
+    pid: Arc<str>,
+    aid: Arc<str>,
     executor: Executor,
     platform: Arc<Box<dyn Platform>>,
     filesystem: FilesystemOverlay,
@@ -45,8 +45,8 @@ impl System {
         let platform = Arc::new(platform);
 
         Self {
-            pid: pid.to_owned(),
-            aid: aid.to_owned(), // TODO create metadata dictionary or something
+            pid: Arc::from(pid),
+            aid: Arc::from(aid),
             executor: Executor::new(),
             filesystem: FilesystemOverlay::new(platform.clone(), aid),
             platform,
