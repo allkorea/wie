@@ -22,7 +22,7 @@ pub trait ArmEngine: Send + AsAny {
     fn run(&mut self, end: u32, count: u32) -> Result<EngineRunResult>;
     fn reg_write(&mut self, reg: ArmRegister, value: u32);
     fn reg_read(&self, reg: ArmRegister) -> u32;
-    fn mem_map(&mut self, address: u32, size: usize, permission: MemoryPermission);
+    fn mem_map(&mut self, address: u32, size: usize, permission: MemoryPermission) -> Result<()>;
     fn mem_write(&mut self, address: u32, data: &[u8]) -> Result<()>;
     fn mem_read(&mut self, address: u32, size: usize, result: &mut [u8]) -> Result<usize>;
     fn is_mapped(&self, address: u32, size: usize) -> bool;

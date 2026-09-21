@@ -525,7 +525,7 @@ impl ArmEngine for DebuggedArm32CpuEngine {
         self.debug.cpu.lock().reg_read(reg)
     }
 
-    fn mem_map(&mut self, address: u32, size: usize, permission: MemoryPermission) {
+    fn mem_map(&mut self, address: u32, size: usize, permission: MemoryPermission) -> wie_util::Result<()> {
         self.debug.cpu.lock().mem_map(address, size, permission)
     }
 
@@ -574,7 +574,7 @@ mod tests {
         extern crate std;
 
         let mut engine = DebuggedArm32CpuEngine::new();
-        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
         engine.mem_write(0x1000, &[0x01, 0xdf, 0x01, 0x30]).unwrap(); // svc #1; add r0, #1
         engine.reg_write(ArmRegister::Cpsr, 0x3f);
         engine.reg_write(ArmRegister::PC, 0x1001);
@@ -605,7 +605,7 @@ mod tests {
         extern crate std;
 
         let mut engine = DebuggedArm32CpuEngine::new();
-        engine.mem_map(0x1000, 0x2000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(0x1000, 0x2000, MemoryPermission::ReadWriteExecute).unwrap();
         engine.debug.resume(vec![1, 2], None);
         let mut contexts = Vec::new();
         for thread_id in [1, 2] {
@@ -641,7 +641,7 @@ mod tests {
         extern crate std;
 
         let mut engine = DebuggedArm32CpuEngine::new();
-        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
         engine.mem_write(0x1000, &[0x01, 0x30, 0x01, 0x30]).unwrap(); // add r0, #1; add r0, #1
         engine.debug.add_breakpoint(0x1000, DebugBreakpointKind::Thumb16).unwrap();
         let debug = engine.debug.clone();
@@ -679,7 +679,7 @@ mod tests {
         extern crate std;
 
         let mut engine = DebuggedArm32CpuEngine::new();
-        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
         engine.mem_write(0x1000, &[0x01, 0x30, 0x01, 0x30, 0x01, 0xdf]).unwrap(); // add r0, #1; add r0, #1; svc #1
         engine.reg_write(ArmRegister::Cpsr, 0x3f);
         engine.reg_write(ArmRegister::PC, 0x1001);
@@ -704,7 +704,7 @@ mod tests {
         let debug = DebugInner::new();
         {
             let mut cpu = debug.cpu.lock();
-            cpu.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute);
+            cpu.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
             cpu.mem_write(0x1000, &[0x12, 0x34]).unwrap();
         }
 
@@ -732,7 +732,7 @@ mod tests {
         let debug = DebugInner::new();
         {
             let mut cpu = debug.cpu.lock();
-            cpu.mem_map(0x2000, 0x1000, MemoryPermission::ReadWriteExecute);
+            cpu.mem_map(0x2000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
             cpu.mem_write(0x2000, &[0x11, 0x22, 0x33, 0x44]).unwrap();
         }
 
@@ -752,7 +752,7 @@ mod tests {
         let debug = DebugInner::new();
         {
             let mut cpu = debug.cpu.lock();
-            cpu.mem_map(0x3000, 0x1000, MemoryPermission::ReadWriteExecute);
+            cpu.mem_map(0x3000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
             cpu.mem_write(0x3000, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
         }
 

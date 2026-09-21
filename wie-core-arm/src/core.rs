@@ -77,8 +77,8 @@ impl ArmCore {
             Box::new(Arm32CpuEngine::new())
         };
 
-        engine.mem_map(FUNCTIONS_BASE, FUNCTIONS_SIZE, MemoryPermission::ReadExecute);
-        engine.mem_map(GLOBAL_DATA_BASE, 0x4000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(FUNCTIONS_BASE, FUNCTIONS_SIZE, MemoryPermission::ReadExecute)?;
+        engine.mem_map(GLOBAL_DATA_BASE, 0x4000, MemoryPermission::ReadWriteExecute)?;
 
         let profile = profile.map(|callback| ProfileState {
             samples: BTreeMap::new(),
@@ -136,11 +136,13 @@ impl ArmCore {
     }
 
     pub fn load(&mut self, data: &[u8], address: u32, map_size: usize) -> Result<()> {
+        let map_size = map_size
+            .checked_add(0xfff)
+            .map(|size| size & !0xfff)
+            .ok_or(WieError::InvalidMemoryAccess(address))?;
         let mut inner = self.inner.lock();
 
-        inner
-            .engine
-            .mem_map(address, map_size.next_multiple_of(0x1000), MemoryPermission::ReadWriteExecute);
+        inner.engine.mem_map(address, map_size, MemoryPermission::ReadWriteExecute)?;
         inner.engine.mem_write(address, data)?;
 
         Ok(())
@@ -401,9 +403,7 @@ impl ArmCore {
 
         let mut inner = self.inner.lock();
 
-        inner.engine.mem_map(address, size as usize, MemoryPermission::ReadWrite);
-
-        Ok(())
+        inner.engine.mem_map(address, size as usize, MemoryPermission::ReadWrite)
     }
 
     pub fn dump_reg_stack(&self, image_base: u32) -> String {

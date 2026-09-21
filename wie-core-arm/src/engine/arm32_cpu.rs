@@ -99,8 +99,8 @@ impl ArmEngine for Arm32CpuEngine {
         self.cpu.reg_get(Mode::User, reg.into_armv4t())
     }
 
-    fn mem_map(&mut self, address: u32, size: usize, _permission: MemoryPermission) {
-        self.mem.map(address, size);
+    fn mem_map(&mut self, address: u32, size: usize, _permission: MemoryPermission) -> Result<()> {
+        self.mem.map(address, size)
     }
 
     fn mem_write(&mut self, address: u32, data: &[u8]) -> Result<()> {
@@ -167,16 +167,20 @@ impl EmulatedMemory {
         Arm32CpuMemory::new(self)
     }
 
-    fn map(&mut self, address: u32, size: usize) {
-        let page_start = address & !PAGE_MASK;
-        let page_end = (address + size as u32 + PAGE_MASK) & !PAGE_MASK;
+    fn map(&mut self, address: u32, size: usize) -> Result<()> {
+        if size as u64 > TOTAL_MEMORY - address as u64 {
+            return Err(WieError::InvalidMemoryAccess(address));
+        }
+        let first_page = address as usize / PAGE_SIZE;
+        let end_page = (address as u64 + size as u64).div_ceil(PAGE_SIZE as u64) as usize;
 
-        for page in (page_start..page_end).step_by(PAGE_SIZE) {
-            let page_data = &mut self.pages[page as usize / PAGE_SIZE];
-            if page_data.is_none() {
-                *page_data = Some(MemoryPage { data: None });
+        for page in &mut self.pages[first_page..end_page] {
+            if page.is_none() {
+                *page = Some(MemoryPage { data: None });
             }
         }
+
+        Ok(())
     }
 
     fn read_range(&self, address: u32, size: usize, result: &mut [u8]) -> Result<usize> {
@@ -403,7 +407,7 @@ mod tests {
     #[test]
     fn run_reports_executed_instructions_at_budget_and_return_boundaries() {
         let mut engine = Arm32CpuEngine::new();
-        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(0x1000, 0x1000, MemoryPermission::ReadWriteExecute).unwrap();
         engine.mem_write(0x1000, &[0xc0, 0x46, 0xc0, 0x46, 0x70, 0x47]).unwrap(); // nop; nop; bx lr
         engine.reg_write(ArmRegister::Cpsr, 0x3f);
         engine.reg_write(ArmRegister::PC, 0x1001);
@@ -428,9 +432,9 @@ mod tests {
     fn test_memory_basic() {
         let mut memory = EmulatedMemory::new();
 
-        memory.map(0x10000, 0x1000);
-        memory.map(0x11000, 0x1000);
-        memory.map(0x20000, 0x10000);
+        memory.map(0x10000, 0x1000).unwrap();
+        memory.map(0x11000, 0x1000).unwrap();
+        memory.map(0x20000, 0x10000).unwrap();
 
         memory.write_range(0x10000, &[123; 0x1000]).unwrap();
 
@@ -471,7 +475,7 @@ mod tests {
     fn test_memory_unmapped_read() {
         let mut memory = EmulatedMemory::new();
 
-        memory.map(0x10000, 0x10000);
+        memory.map(0x10000, 0x10000).unwrap();
 
         let mut buf = [0; 0x1000];
         assert!(memory.read_range(0x1f500, 0x1000, &mut buf).is_err());
@@ -487,7 +491,7 @@ mod tests {
     fn test_memory_unmapped_write() {
         let mut memory = EmulatedMemory::new();
 
-        memory.map(0x10000, 0x10000);
+        memory.map(0x10000, 0x10000).unwrap();
 
         assert!(memory.write_range(0x1f500, &[12; 0x1000]).is_err());
 
@@ -499,7 +503,7 @@ mod tests {
     #[test]
     fn mapped_pages_materialize_only_on_write_and_remapping_preserves_data() {
         let mut memory = EmulatedMemory::new();
-        memory.map(0x40000000, 0x10000000);
+        memory.map(0x40000000, 0x10000000).unwrap();
         assert!(memory.is_mapped(0x40000000, 0x10000000));
         assert!(!memory.is_mapped(0x50000000, 1));
         assert!(memory.pages.iter().flatten().all(|page| page.data.is_none()));
@@ -512,16 +516,29 @@ mod tests {
 
         memory.as_arm32cpu_memory().w32(0x40000000, 0x12345678);
         memory.write_range(0x40010000, &[42]).unwrap();
-        memory.map(0x40000000, 0x10000000);
+        memory.map(0x40000000, 0x10000000).unwrap();
         assert_eq!(memory.as_arm32cpu_memory().r32(0x40000000), 0x12345678);
         assert_eq!(memory.as_arm32cpu_memory().r8(0x40010000), 42);
         assert_eq!(memory.pages.iter().flatten().filter(|page| page.data.is_some()).count(), 2);
+
+        assert!(memory.map(u32::MAX, 2).is_err());
+        assert!(!memory.is_mapped(u32::MAX, 1));
+        memory.map(u32::MAX, 1).unwrap();
+        assert!(memory.is_mapped(u32::MAX, 1));
+        assert!(!memory.is_mapped(u32::MAX, 2));
+        assert_eq!(memory.as_arm32cpu_memory().r8(u32::MAX), 0);
+        assert_eq!(memory.pages.iter().flatten().filter(|page| page.data.is_some()).count(), 2);
+        memory.write_range(u32::MAX, &[99]).unwrap();
+        memory.map(u32::MAX, 1).unwrap();
+        assert_eq!(memory.as_arm32cpu_memory().r8(u32::MAX), 99);
+        assert!(memory.write_range(u32::MAX, &[1, 2]).is_err());
+        assert_eq!(memory.as_arm32cpu_memory().r8(u32::MAX), 99);
     }
 
     #[test]
     fn cpu_accesses_cross_lazy_page_boundaries() {
         let mut memory = EmulatedMemory::new();
-        memory.map(0x10000, 0x20000);
+        memory.map(0x10000, 0x20000).unwrap();
         let mut access = memory.as_arm32cpu_memory();
         assert_eq!(access.r32(0x1fffe), 0);
         access.w16(0x1ffff, 0x1234);
