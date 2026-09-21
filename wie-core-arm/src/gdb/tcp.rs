@@ -1,44 +1,110 @@
 extern crate std;
 
-use alloc::format;
+use alloc::{format, sync::Arc};
 use std::{
     io,
-    net::{TcpListener, TcpStream},
-    println, thread,
+    net::{Shutdown, TcpListener, TcpStream},
+    println,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use gdbstub::{
     stub::{DisconnectReason, GdbStub},
     target::ext::base::multithread::MultiThreadResume,
 };
+use spin::Mutex;
 
-use crate::ArmCore;
+use crate::{ArmCore, engine::DebugInner};
 
 use super::{GdbBlockingEventLoop, GdbTarget};
 
-pub(crate) fn start(core: ArmCore) -> wie_util::Result<()> {
-    let sock = TcpListener::bind("127.0.0.1:2159").map_err(|err| wie_util::WieError::FatalError(format!("Failed to start GDB server: {err}")))?;
-    let this = GdbTarget::new(core);
-    thread::Builder::new()
-        .spawn(move || {
-            if let Err(err) = this.run_gdb_server(sock) {
+pub(crate) struct GdbServer {
+    debug: Arc<DebugInner>,
+    connection: Arc<Mutex<Option<TcpStream>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) fn start(core: ArmCore) -> wie_util::Result<GdbServer> {
+    TcpListener::bind("127.0.0.1:2159")
+        .and_then(|listener| GdbServer::new(core, listener))
+        .map_err(|err| wie_util::WieError::FatalError(format!("Failed to start GDB server: {err}")))
+}
+
+impl GdbServer {
+    fn new(core: ArmCore, listener: TcpListener) -> io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let target = GdbTarget::new(core);
+        let debug = target.debug.clone();
+        let connection = Arc::new(Mutex::new(None));
+        let server_connection = connection.clone();
+        let thread = thread::Builder::new().spawn(move || {
+            if let Err(err) = target.run_gdb_server(listener, server_connection) {
                 tracing::error!("GDB server error: {err}");
             }
+        })?;
+        Ok(Self {
+            debug,
+            connection,
+            thread: Mutex::new(Some(thread)),
         })
-        .map_err(|err| wie_util::WieError::FatalError(format!("Failed to start GDB server thread: {err}")))?;
-    Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        // The target has no server handle, so joining cannot reenter this lock.
+        // Serialize callers until the server has actually released its target.
+        let mut handle = self.thread.lock();
+        self.debug.shutdown();
+        let connection = self.connection.lock().take();
+        if let Some(connection) = connection
+            && let Err(error) = connection.shutdown(Shutdown::Both)
+            && error.kind() != io::ErrorKind::NotConnected
+        {
+            tracing::warn!("Failed to close GDB connection: {error}");
+        }
+        if let Some(thread) = handle.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                tracing::error!("GDB server thread panicked during shutdown");
+            }
+        }
+    }
+}
+
+impl Drop for GdbServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl GdbTarget {
-    fn run_gdb_server(mut self, sock: TcpListener) -> io::Result<()> {
+    fn run_gdb_server(mut self, sock: TcpListener, connection: Arc<Mutex<Option<TcpStream>>>) -> io::Result<()> {
         println!("GDB server listening on {}", sock.local_addr()?);
 
-        loop {
-            let (stream, addr) = sock.accept()?;
+        while !self.debug.is_stopped() {
+            let (stream, addr) = match sock.accept() {
+                Ok(client) => client,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(Duration::from_millis(50));
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            {
+                let mut active = connection.lock();
+                if self.debug.is_stopped() {
+                    break;
+                }
+                *active = Some(stream.try_clone()?);
+            }
 
             println!("GDB client attached from {addr}");
 
-            match self.run_session(stream) {
+            let result = self.run_session(stream);
+            let closed = connection.lock().take();
+            drop(closed);
+            match result {
                 Ok(DisconnectReason::Disconnect) => {
                     println!("GDB client requested detach");
                     println!("GDB client detached");
@@ -61,12 +127,19 @@ impl GdbTarget {
             }
             println!("GDB server waiting for next client");
         }
+        Ok(())
     }
 
     fn run_session(&mut self, stream: TcpStream) -> io::Result<DisconnectReason> {
         self.debug.pause();
+        if self.debug.is_stopped() {
+            return Ok(DisconnectReason::TargetExited(0));
+        }
         self.clear_resume_actions().map_err(io::Error::other)?;
         let result = GdbStub::new(stream).run_blocking::<GdbBlockingEventLoop<TcpStream>>(self);
+        if self.debug.is_stopped() {
+            return Ok(DisconnectReason::TargetExited(0));
+        }
         self.debug
             .detach()
             .map_err(|err| io::Error::other(format!("Failed to detach GDB: {err}")))?;
@@ -84,6 +157,7 @@ mod tests {
     };
     use std::io::{Read, Write};
 
+    use crossbeam::channel;
     use gdbstub::{common::Tid, target::ext::base::multithread::MultiThreadSingleStep};
 
     use crate::{Allocator, engine::DebuggedArm32CpuEngine};
@@ -315,5 +389,72 @@ mod tests {
         assert_eq!(stepped_breakpoint, "T05thread:p01.01;");
         assert_eq!(stepped_threads, "T05thread:p01.01;");
         assert_eq!(&registers[..8], "02000000");
+    }
+
+    #[test]
+    fn shutdown_releases_idle_initial_paused_and_running_sessions() {
+        for mode in 0..4 {
+            let mut core = ArmCore::new(false, None).unwrap();
+            let engine = DebuggedArm32CpuEngine::new();
+            let debug = engine.debug_inner();
+            core.inner.lock().engine = Box::new(engine);
+            Allocator::init(&mut core).unwrap();
+            let weak_core = Arc::downgrade(&core.inner);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = GdbServer::new(core.clone(), listener).unwrap();
+            let (task_tx, task_rx) = channel::bounded(1);
+            let runner = if mode >= 2 {
+                core.load(&[0x01, 0x30, 0xfd, 0xe7], 0x1000, 4).unwrap();
+                let mut running = core.clone();
+                let task = core.run_in_thread(move || async move { running.run_function::<()>(0x1001, &[0]).await }).unwrap();
+                Some(thread::spawn(move || task_tx.send(futures::executor::block_on(task)).unwrap()))
+            } else {
+                None
+            };
+            let mut client = if mode > 0 { Some(TcpStream::connect(address).unwrap()) } else { None };
+            if let Some(stream) = client.as_mut() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while server.connection.lock().is_none() {
+                    assert!(std::time::Instant::now() < deadline, "GDB did not accept the client");
+                    thread::yield_now();
+                }
+                if mode >= 2 {
+                    send_packet(stream, "qSupported:multiprocess+;swbreak+");
+                    read_packet(stream);
+                    if mode == 2 {
+                        // Leave the packet reader waiting for the remaining bytes.
+                        Write::write_all(stream, b"$g").unwrap();
+                    } else {
+                        send_packet(stream, "vCont;c");
+                    }
+                }
+            }
+            let (done_tx, done_rx) = channel::bounded(1);
+            let stopper = thread::spawn(move || {
+                server.shutdown();
+                server.shutdown();
+                done_tx.send(()).unwrap();
+                server
+            });
+            done_rx.recv_timeout(Duration::from_secs(2)).expect("GDB shutdown blocked");
+            let server = stopper.join().unwrap();
+            if let Some(runner) = runner {
+                assert!(task_rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+                runner.join().unwrap();
+            }
+            debug.resume(Vec::new(), None);
+            debug.interrupt();
+            assert!(debug.is_stopped());
+            drop(client);
+            core.shutdown();
+            drop(server);
+            drop(core);
+            assert!(weak_core.upgrade().is_none());
+            if mode == 0 {
+                TcpListener::bind(address).unwrap();
+            }
+        }
     }
 }

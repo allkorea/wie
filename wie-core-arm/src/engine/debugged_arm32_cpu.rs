@@ -27,6 +27,7 @@ enum RunState {
         svc_steps: BTreeSet<ThreadId>,
     },
     Interrupt,
+    Stopped,
 }
 
 #[derive(Copy, Clone)]
@@ -44,6 +45,7 @@ pub(crate) enum DebugStopReason {
     Signal(DebugSignal, ThreadId),
     SwBreak(ThreadId),
     DoneStep(ThreadId),
+    Exited,
 }
 
 #[derive(Copy, Clone)]
@@ -229,9 +231,26 @@ impl DebugInner {
         self.stop_event_rx.recv_timeout(timeout)
     }
 
+    pub(crate) fn is_stopped(&self) -> bool {
+        matches!(*self.run_state.lock(), RunState::Stopped)
+    }
+
+    pub(crate) fn shutdown(&self) {
+        {
+            let mut state = self.run_state.lock();
+            if matches!(*state, RunState::Stopped) {
+                return;
+            }
+            *state = RunState::Stopped;
+        }
+        // Wake both the GDB event loop and a guest blocked waiting for resume.
+        let _ = self.stop_event_tx.send(DebugStopReason::Exited);
+        let _ = self.resume_tx.try_send(());
+    }
+
     pub(crate) fn pause(&self) {
         self.interrupt();
-        while !matches!(*self.run_state.lock(), RunState::Paused) {
+        while !matches!(*self.run_state.lock(), RunState::Paused | RunState::Stopped) {
             self.stop_event_rx.recv().unwrap();
         }
         // The initial stop is reported by gdbstub during the connection handshake.
@@ -247,8 +266,12 @@ impl DebugInner {
     }
 
     pub(crate) fn resume(&self, step_threads: Vec<ThreadId>, resumed_threads: Option<Vec<ThreadId>>) {
+        let mut state = self.run_state.lock();
+        if matches!(*state, RunState::Stopped) {
+            return;
+        }
         *self.resumed_threads.lock() = resumed_threads;
-        *self.run_state.lock() = RunState::Running {
+        *state = RunState::Running {
             step_threads,
             svc_steps: BTreeSet::new(),
         };
@@ -285,6 +308,9 @@ impl DebugInner {
 
     pub(crate) fn detach(&self) -> wie_util::Result<()> {
         self.pause();
+        if self.is_stopped() {
+            return Ok(());
+        }
         let addresses: Vec<_> = self.breakpoints.lock().keys().copied().collect();
         for address in addresses {
             self.remove_breakpoint(address)?;
@@ -344,7 +370,7 @@ impl DebugInner {
     pub(crate) fn on_thread_entered(&self, thread_id: ThreadId) {
         *self.current_thread.lock() = Some(thread_id);
         if !matches!(*self.run_state.lock(), RunState::Initial) {
-            self.wait_for_resume_mode(thread_id);
+            let _ = self.wait_for_resume_mode(thread_id);
         }
     }
 
@@ -355,16 +381,16 @@ impl DebugInner {
         }
     }
 
-    fn wait_for_resume_mode(&self, thread_id: ThreadId) -> ResumeMode {
+    fn wait_for_resume_mode(&self, thread_id: ThreadId) -> Option<ResumeMode> {
         loop {
             let state = self.run_state.lock();
             match &*state {
                 RunState::Running { step_threads, svc_steps } => {
-                    return if step_threads.contains(&thread_id) && !svc_steps.contains(&thread_id) {
+                    return Some(if step_threads.contains(&thread_id) && !svc_steps.contains(&thread_id) {
                         ResumeMode::Step
                     } else {
                         ResumeMode::Continue
-                    };
+                    });
                 }
                 RunState::Paused => {
                     drop(state);
@@ -374,14 +400,17 @@ impl DebugInner {
                     drop(state);
                     self.stop(DebugStopReason::Signal(DebugSignal::Int, thread_id));
                 }
+                RunState::Stopped => return None,
             }
         }
     }
 
     fn stop(&self, reason: DebugStopReason) {
         let mut state = self.run_state.lock();
-        *state = RunState::Paused;
-        self.stop_event_tx.send(reason).unwrap();
+        if !matches!(*state, RunState::Stopped) {
+            *state = RunState::Paused;
+            self.stop_event_tx.send(reason).unwrap();
+        }
     }
 
     fn normalize_addr(addr: u32) -> u32 {
@@ -458,7 +487,9 @@ impl ArmEngine for DebuggedArm32CpuEngine {
         let mut instructions_executed = 0;
         loop {
             let thread_id = self.stop_thread_id();
-            let resume_mode = self.debug.wait_for_resume_mode(thread_id);
+            let Some(resume_mode) = self.debug.wait_for_resume_mode(thread_id) else {
+                return Err(WieError::FatalError("GDB target has shut down".into()));
+            };
             if !self.debug.is_thread_resumed(thread_id) {
                 return Ok(EngineRunResult {
                     stop_reason: EngineStopReason::Yield,

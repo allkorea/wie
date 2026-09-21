@@ -3,7 +3,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use wie_util::Result;
+use wie_util::{Result, WieError};
 
 use crate::{ArmCore, ThreadId};
 
@@ -45,10 +45,13 @@ impl Future for ArmCoreThreadWrapper {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _guard = self.thread.core.enter_thread_context(self.thread.thread_id);
 
-        if let Some(debug) = self.thread.core.debug_inner()
-            && !debug.is_thread_resumed(self.thread.thread_id)
-        {
-            return Poll::Pending;
+        if let Some(debug) = self.thread.core.debug_inner() {
+            if debug.is_stopped() {
+                return Poll::Ready(Err(WieError::FatalError("GDB target has shut down".into())));
+            }
+            if !debug.is_thread_resumed(self.thread.thread_id) {
+                return Poll::Pending;
+            }
         }
 
         self.future.as_mut().poll(cx)

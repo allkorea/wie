@@ -67,6 +67,8 @@ fn drain_samples(samples: &mut BTreeMap<Vec<u32>, u64>) -> Vec<ProfileSample> {
 pub struct ArmCore {
     pub(crate) inner: Arc<Mutex<ArmCoreInner>>, // TODO can we change it to another lock like async-lock?
     threads: Arc<Mutex<BTreeMap<ThreadId, ThreadState>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    gdb_server: Option<Arc<crate::gdb::GdbServer>>,
 }
 
 impl ArmCore {
@@ -98,17 +100,38 @@ impl ArmCore {
         let result = Self {
             inner: Arc::new(Mutex::new(inner)),
             threads: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            gdb_server: None,
         };
 
         if enable_gdbserver {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // The server's target must not retain its own join handle.
+                let server = crate::gdb::start(result.clone())?;
+                return Ok(Self {
+                    gdb_server: Some(Arc::new(server)),
+                    ..result
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
             crate::gdb::start(result.clone())?;
         }
 
         Ok(result)
     }
 
+    /// Stop and join the debugger before the runtime owner cancels guest tasks.
+    pub fn stop_debugger(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(server) = &self.gdb_server {
+            server.shutdown();
+        }
+    }
+
     /// Terminal owner cleanup after all runtime tasks have stopped; do not resume this core afterwards.
     pub fn shutdown(&mut self) {
+        self.stop_debugger();
         let (handlers, profile) = {
             let mut inner = self.inner.lock();
             (core::mem::take(&mut inner.svc_handlers), inner.profile.take())
