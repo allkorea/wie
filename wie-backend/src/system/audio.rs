@@ -26,6 +26,13 @@ impl Audio {
         }
     }
 
+    pub fn shutdown(&mut self) {
+        for handle in core::mem::take(&mut self.playing) {
+            self.sink.send(AudioCommand::Stop { handle });
+        }
+        self.files.clear();
+    }
+
     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
         let audio_handle = self.last_audio_handle;
         let sequence = Arc::new(convert_smaf_events(parse_smaf(data)));
@@ -187,5 +194,13 @@ mod tests {
 
         assert_eq!(commands.lock().unwrap()[1], AudioCommand::Stop { handle });
         assert!(audio.play(handle, false).is_err());
+
+        let next = audio.load_smaf(&[]).unwrap();
+        audio.play(next, true).unwrap();
+        audio.shutdown();
+        assert_eq!(commands.lock().unwrap()[3], AudioCommand::Stop { handle: next });
+        assert!(audio.play(next, false).is_err());
+        audio.shutdown();
+        assert_eq!(commands.lock().unwrap().len(), 4);
     }
 }

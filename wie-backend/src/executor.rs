@@ -33,6 +33,7 @@ pub struct ExecutorInner {
     sleeping_tasks: HashMap<usize, Instant>,
     last_task_id: usize,
     last_now: Instant,
+    stopped: bool,
 }
 
 pub trait AsyncCallable<R>: Send
@@ -87,6 +88,7 @@ impl Executor {
             sleeping_tasks: HashMap::new(),
             last_task_id: 0,
             last_now: Instant::from_epoch_millis(0),
+            stopped: false,
         }));
 
         Self {
@@ -95,6 +97,7 @@ impl Executor {
         }
     }
 
+    /// Returns zero if the runtime owner has already shut down this executor.
     pub fn spawn<C, R>(&self, callable: C) -> usize
     where
         C: AsyncCallable<R> + 'static,
@@ -111,14 +114,29 @@ impl Executor {
 
         let task_id = {
             let mut inner = self.inner.lock();
+            if inner.stopped {
+                return 0;
+            }
             inner.last_task_id += 1;
-            inner.last_task_id
+            let task_id = inner.last_task_id;
+            inner.tasks.insert(task_id, Box::pin(fut));
+            task_id
         };
 
-        self.inner.lock().tasks.insert(task_id, Box::pin(fut));
         self.wake.wake_by_ref();
 
         task_id
+    }
+
+    pub fn shutdown(&self) {
+        let tasks = {
+            let mut inner = self.inner.lock();
+            inner.stopped = true;
+            inner.sleeping_tasks.clear();
+            core::mem::take(&mut inner.tasks)
+        };
+        // Futures can own this executor and ARM guards whose destructors take locks.
+        drop(tasks);
     }
 
     // TODO we need to remove error handling from here. we need to JoinHandle like on spawn..
@@ -136,6 +154,9 @@ impl Executor {
 
             {
                 let inner = self.inner.lock();
+                if inner.stopped {
+                    break;
+                }
                 let running_task_count = inner.tasks.len() - inner.sleeping_tasks.len();
                 if running_task_count == 0 && !inner.sleeping_tasks.is_empty() {
                     let next_wakeup = *inner.sleeping_tasks.values().min().unwrap();
@@ -170,6 +191,9 @@ impl Executor {
         let waker = Waker::from(self.wake.clone());
 
         for (task_id, mut task) in tasks.into_iter() {
+            if self.inner.lock().stopped {
+                break;
+            }
             let item = sleeping_tasks.get(&task_id);
             if let Some(item) = item {
                 if *item <= now {
@@ -198,17 +222,25 @@ impl Executor {
             self.inner.lock().current_task_id = None;
         }
 
-        self.inner.lock().sleeping_tasks.extend(sleeping_tasks);
-        self.inner.lock().tasks.extend(next_tasks);
+        {
+            let mut inner = self.inner.lock();
+            if !inner.stopped {
+                inner.sleeping_tasks.extend(sleeping_tasks);
+                inner.tasks.extend(next_tasks);
+            }
+        }
 
         if let Some(err) = first_error { Err(err) } else { Ok(()) }
     }
 
     pub(crate) fn sleep(&self, timeout: u64) {
-        let task_id = self.inner.lock().current_task_id.unwrap();
-
-        let until = self.inner.lock().last_now + timeout;
-        self.inner.lock().sleeping_tasks.insert(task_id, until);
+        let mut inner = self.inner.lock();
+        if inner.stopped {
+            return;
+        }
+        let task_id = inner.current_task_id.unwrap();
+        let until = inner.last_now + timeout;
+        inner.sleeping_tasks.insert(task_id, until);
         self.wake.wake_by_ref();
     }
 }
@@ -358,5 +390,39 @@ mod tests {
 
         assert!(completed_a.load(Ordering::Relaxed));
         assert!(completed_b.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shutdown_drops_tasks_outside_locks_and_does_not_requeue_them() {
+        struct OnDrop(Executor, Arc<AtomicUsize>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                assert!(self.0.inner.try_lock().is_some());
+                assert_eq!(self.0.spawn(|| async {}), 0);
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for stop_inside_poll in [false, true] {
+            let mut executor = Executor::new();
+            let weak = Arc::downgrade(&executor.inner);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let guard = OnDrop(executor.clone(), drops.clone());
+            executor.spawn(move || async move {
+                let guard = guard;
+                if stop_inside_poll {
+                    guard.0.shutdown();
+                }
+                core::future::pending::<()>().await;
+                drop(guard);
+            });
+            executor.tick(advancing_clock(0)).unwrap();
+            executor.shutdown();
+            executor.shutdown();
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(executor.inner.lock().tasks.is_empty());
+            drop(executor);
+            assert!(weak.upgrade().is_none());
+        }
     }
 }

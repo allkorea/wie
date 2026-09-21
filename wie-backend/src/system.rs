@@ -57,6 +57,15 @@ impl System {
         }
     }
 
+    /// Terminal cleanup by the emulator owner; dropping a shared System handle does not stop it.
+    pub fn shutdown(&mut self) {
+        self.executor.shutdown();
+        let events = core::mem::take(&mut *self.event_queue.write());
+        // Timer callbacks can retain System handles; release them without the queue lock.
+        drop(events);
+        self.audio.write().shutdown();
+    }
+
     pub fn tick(&mut self) -> Result<()> {
         let platform = self.platform.clone();
         self.executor.tick(move || platform.now())
