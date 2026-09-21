@@ -154,7 +154,7 @@ impl KtfEmulator {
 
         let main_class_name = main_class_name.replace('.', "/");
 
-        let main_class_name_java = JavaLangString::from_rust_string(&jvm, &main_class_name).await.unwrap();
+        let main_class_name_java = JavaLangString::from_rust_string(jvm, &main_class_name).await.unwrap();
         let _main_class: Box<dyn ClassInstance> = jvm
             .invoke_virtual(
                 &class_loader,
@@ -257,6 +257,7 @@ mod tests {
         let second = contexts[1].load(Ordering::Relaxed);
         assert_ne!(first, 0);
         assert_ne!(second, 0);
+        assert_ne!(first, second);
 
         Ok(())
     }
