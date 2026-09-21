@@ -40,6 +40,7 @@ pub struct LgtEmulator {
 
 impl Drop for LgtEmulator {
     fn drop(&mut self) {
+        self.core.stop_debugger();
         self.system.shutdown();
         self.core.shutdown();
     }

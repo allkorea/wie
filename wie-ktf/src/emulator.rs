@@ -87,6 +87,7 @@ pub struct KtfEmulator {
 
 impl Drop for KtfEmulator {
     fn drop(&mut self) {
+        self.core.stop_debugger();
         self.system.shutdown();
         self.core.shutdown();
     }
