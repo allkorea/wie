@@ -26,7 +26,7 @@ where
     F: FnOnce(&mut dyn wie_backend::canvas::Canvas),
 {
     let mut canvas = framebuffer.canvas(context)?;
-    operation(&mut **canvas);
+    operation(&mut *canvas);
     canvas.flush()
 }
 
