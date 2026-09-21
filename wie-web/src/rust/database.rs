@@ -80,7 +80,7 @@ impl wie_backend::Database for Database {
     }
 
     async fn get(&self, id: RecordId) -> Option<Vec<u8>> {
-        self.store.get(self.record_key(id)).await.map(|a| a.to_vec())
+        self.store.get(self.record_key(id)).await
     }
 
     async fn set(&mut self, id: RecordId, data: &[u8]) -> bool {
