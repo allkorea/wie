@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format};
+use alloc::{boxed::Box, format, vec::Vec};
 
 use arm32_cpu::{Cpu, Memory, Mode, reg};
 
@@ -72,8 +72,8 @@ impl ArmEngine for Arm32CpuEngine {
             }
             instructions_executed += 1;
 
-            if let Some(x) = arm32cpu_memory.memory_error {
-                return Err(WieError::InvalidMemoryAccess(x));
+            if let Some(error) = arm32cpu_memory.memory_error {
+                return Err(error);
             }
         };
 
@@ -150,6 +150,21 @@ struct MemoryPage {
     data: Option<Box<[u8; PAGE_SIZE]>>,
 }
 
+impl MemoryPage {
+    fn data_mut(&mut self) -> Result<&mut [u8; PAGE_SIZE]> {
+        match &mut self.data {
+            Some(data) => Ok(data.as_mut()),
+            slot => {
+                let mut data = Vec::<u8>::new();
+                data.try_reserve_exact(PAGE_SIZE).map_err(|_| WieError::AllocationFailure)?;
+                data.resize(PAGE_SIZE, 0);
+                let data = data.into_boxed_slice().try_into().map_err(|_| WieError::AllocationFailure)?;
+                Ok(slot.insert(data).as_mut())
+            }
+        }
+    }
+}
+
 struct EmulatedMemory {
     pages: Box<[Option<MemoryPage>]>,
 }
@@ -168,6 +183,9 @@ impl EmulatedMemory {
     }
 
     fn map(&mut self, address: u32, size: usize) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
         if size as u64 > TOTAL_MEMORY - address as u64 {
             return Err(WieError::InvalidMemoryAccess(address));
         }
@@ -221,7 +239,7 @@ impl EmulatedMemory {
             let page = self.pages[page_address as usize / PAGE_SIZE]
                 .as_mut()
                 .ok_or(WieError::InvalidMemoryAccess(current_address))?;
-            let page_data = page.data.get_or_insert_with(|| Box::new([0; PAGE_SIZE]));
+            let page_data = page.data_mut()?;
             let offset = (current_address - page_address) as usize;
             let available_bytes = (PAGE_SIZE - offset).min(data.len() - data_index);
 
@@ -236,18 +254,21 @@ impl EmulatedMemory {
     }
 
     fn is_mapped(&self, address: u32, size: usize) -> bool {
+        if size == 0 {
+            return true;
+        }
         if size as u64 > TOTAL_MEMORY - address as u64 {
             return false;
         }
         let first_page = address as usize / PAGE_SIZE;
-        let last_page = ((address as u64 + size.saturating_sub(1) as u64) / PAGE_SIZE as u64) as usize;
+        let last_page = ((address as u64 + (size - 1) as u64) / PAGE_SIZE as u64) as usize;
         self.pages[first_page..=last_page].iter().all(Option::is_some)
     }
 }
 
 struct Arm32CpuMemory<'a> {
     emulated_memory: &'a mut EmulatedMemory,
-    memory_error: Option<u32>,
+    memory_error: Option<WieError>,
 }
 
 impl<'a> Arm32CpuMemory<'a> {
@@ -263,7 +284,7 @@ impl<'a> Arm32CpuMemory<'a> {
         if let Some(page) = page {
             Some(page.data.as_deref().unwrap_or(&ZERO_PAGE))
         } else {
-            self.memory_error = Some(addr);
+            self.memory_error = Some(WieError::InvalidMemoryAccess(addr));
             None
         }
     }
@@ -271,9 +292,15 @@ impl<'a> Arm32CpuMemory<'a> {
     fn get_page_mut(&mut self, addr: u32) -> Option<&mut [u8; PAGE_SIZE]> {
         let page = self.emulated_memory.pages[addr as usize / PAGE_SIZE].as_mut();
         if let Some(page) = page {
-            Some(page.data.get_or_insert_with(|| Box::new([0; PAGE_SIZE])).as_mut())
+            match page.data_mut() {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    self.memory_error = Some(error);
+                    None
+                }
+            }
         } else {
-            self.memory_error = Some(addr);
+            self.memory_error = Some(WieError::InvalidMemoryAccess(addr));
             None
         }
     }
@@ -281,10 +308,7 @@ impl<'a> Arm32CpuMemory<'a> {
     fn read_cross_page<const N: usize>(&mut self, addr: u32) -> [u8; N] {
         let mut data = [0; N];
         if let Err(error) = self.emulated_memory.read_range(addr, N, &mut data) {
-            self.memory_error = Some(match error {
-                WieError::InvalidMemoryAccess(address) => address,
-                _ => addr,
-            });
+            self.memory_error = Some(error);
             return [0; N];
         }
         data
@@ -292,10 +316,7 @@ impl<'a> Arm32CpuMemory<'a> {
 
     fn write_cross_page(&mut self, addr: u32, data: &[u8]) {
         if let Err(error) = self.emulated_memory.write_range(addr, data) {
-            self.memory_error = Some(match error {
-                WieError::InvalidMemoryAccess(address) => address,
-                _ => addr,
-            });
+            self.memory_error = Some(error);
         }
     }
 }
@@ -400,6 +421,8 @@ mod tests {
 
     use arm32_cpu::Memory;
 
+    use wie_util::WieError;
+
     use crate::engine::{ArmEngine, ArmRegister, EngineStopReason, MemoryPermission};
 
     use super::{Arm32CpuEngine, EmulatedMemory, MemoryPage};
@@ -482,9 +505,9 @@ mod tests {
 
         let mut access = memory.as_arm32cpu_memory();
         assert_eq!(access.r32(0x20000), 0);
-        assert_eq!(access.memory_error, Some(0x20000));
+        assert!(matches!(access.memory_error, Some(WieError::InvalidMemoryAccess(0x20000))));
         assert_eq!(access.r16(0x1ffff), 0);
-        assert_eq!(access.memory_error, Some(0x20000));
+        assert!(matches!(access.memory_error, Some(WieError::InvalidMemoryAccess(0x20000))));
     }
 
     #[test]
@@ -497,12 +520,19 @@ mod tests {
 
         let mut access = memory.as_arm32cpu_memory();
         access.w32(0x20000, 12);
-        assert_eq!(access.memory_error, Some(0x20000));
+        assert!(matches!(access.memory_error, Some(WieError::InvalidMemoryAccess(0x20000))));
     }
 
     #[test]
     fn mapped_pages_materialize_only_on_write_and_remapping_preserves_data() {
         let mut memory = EmulatedMemory::new();
+        for address in [0, 1, u32::MAX] {
+            memory.map(address, 0).unwrap();
+            assert!(memory.is_mapped(address, 0));
+            assert!(!memory.is_mapped(address, 1));
+        }
+        assert!(memory.pages.iter().all(Option::is_none));
+
         memory.map(0x40000000, 0x10000000).unwrap();
         assert!(memory.is_mapped(0x40000000, 0x10000000));
         assert!(!memory.is_mapped(0x50000000, 1));
@@ -545,6 +575,6 @@ mod tests {
         assert_eq!(access.r16(0x1ffff), 0x1234);
         access.w32(0x1fffe, 0xaabbccdd);
         assert_eq!(access.r32(0x1fffe), 0xaabbccdd);
-        assert_eq!(access.memory_error, None);
+        assert!(access.memory_error.is_none());
     }
 }
