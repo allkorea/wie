@@ -38,6 +38,13 @@ pub struct LgtEmulator {
     system: System,
 }
 
+impl Drop for LgtEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+        self.core.shutdown();
+    }
+}
+
 impl LgtEmulator {
     pub fn from_archive(platform: Box<dyn Platform>, files: BTreeMap<String, Vec<u8>>, options: Options) -> Result<Self> {
         let app_info = files

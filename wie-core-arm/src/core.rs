@@ -107,6 +107,24 @@ impl ArmCore {
         Ok(result)
     }
 
+    /// Terminal owner cleanup after all runtime tasks have stopped; do not resume this core afterwards.
+    pub fn shutdown(&mut self) {
+        let (handlers, profile) = {
+            let mut inner = self.inner.lock();
+            (core::mem::take(&mut inner.svc_handlers), inner.profile.take())
+        };
+        let threads = core::mem::take(&mut *self.threads.lock());
+        // Thread stacks and callback contexts can retain ArmCore and reenter its locks on drop.
+        drop(threads);
+        drop(handlers);
+        if let Some(mut profile) = profile {
+            let batch = drain_samples(&mut profile.samples);
+            if !batch.is_empty() {
+                (profile.callback)(batch);
+            }
+        }
+    }
+
     pub(crate) fn debug_inner(&self) -> Option<Arc<DebugInner>> {
         let inner = self.inner.lock();
 
@@ -1013,5 +1031,28 @@ mod tests {
             EngineStopReason::End => panic!("expected SVC, got end"),
             EngineStopReason::Yield => panic!("expected SVC, got yield"),
         }
+    }
+
+    #[test]
+    fn shutdown_breaks_callback_and_thread_ownership_cycles() {
+        async fn handler(_: &mut ArmCore, _: &mut ArmCore) -> Result<()> {
+            Ok(())
+        }
+
+        let mut core = ArmCore::new(false, None).unwrap();
+        crate::Allocator::init(&mut core).unwrap();
+        let weak_core = Arc::downgrade(&core.inner);
+        let weak_threads = Arc::downgrade(&core.threads);
+        let context = core.clone();
+        core.register_svc_handler(1, handler, &context).unwrap();
+        drop(context);
+        let thread = core.run_in_thread(|| async { Ok(()) }).unwrap();
+        core.shutdown();
+        core.shutdown();
+        assert!(core.get_thread_ids().is_empty());
+        drop(thread);
+        drop(core);
+        assert!(weak_core.upgrade().is_none());
+        assert!(weak_threads.upgrade().is_none());
     }
 }
