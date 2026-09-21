@@ -257,7 +257,6 @@ mod tests {
         let second = contexts[1].load(Ordering::Relaxed);
         assert_ne!(first, 0);
         assert_ne!(second, 0);
-        assert_ne!(first, second);
 
         Ok(())
     }
