@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::VecDeque};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::pin::Pin;
 
 use wie_util::Result;
@@ -69,18 +69,27 @@ pub enum Event {
     Keydown(KeyCode),
     Keyup(KeyCode),
     Keyrepeat(KeyCode),
-    Timer { due: Instant, callback: TimerCallback },
-    Notify { r#type: i32, param1: i32, param2: i32 }, // wipi notifyEvent
+    Timer {
+        due: Instant,
+        id: Option<u32>,
+        callback: TimerCallback,
+    },
+    Notify {
+        r#type: i32,
+        param1: i32,
+        param2: i32,
+    }, // wipi notifyEvent
 }
 
 impl Event {
-    pub fn timer<F, Fut>(due: Instant, callback: F) -> Self
+    pub fn timer<F, Fut>(due: Instant, id: Option<u32>, callback: F) -> Self
     where
         F: FnOnce() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         Event::Timer {
             due,
+            id,
             callback: Box::new(move || Box::pin(callback())),
         }
     }
@@ -112,6 +121,31 @@ impl EventQueue {
     pub fn pop(&mut self) -> Option<Event> {
         self.input_events.pop_front().or_else(|| self.events.pop_front())
     }
+
+    pub fn pop_ready(&mut self, now: Instant) -> Option<Event> {
+        if let Some(input) = self.input_events.pop_front() {
+            return Some(input);
+        }
+        let index = self
+            .events
+            .iter()
+            .position(|event| !matches!(event, Event::Timer { due, .. } if *due > now))?;
+        self.events.remove(index)
+    }
+
+    /// The caller drops removed callbacks after releasing the event queue lock.
+    pub fn cancel_timer(&mut self, timer: u32) -> Vec<Event> {
+        let mut cancelled = Vec::new();
+        for _ in 0..self.events.len() {
+            let event = self.events.pop_front().unwrap();
+            if matches!(event, Event::Timer { id: Some(id), .. } if id == timer) {
+                cancelled.push(event);
+            } else {
+                self.events.push_back(event);
+            }
+        }
+        cancelled
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +153,26 @@ mod tests {
     use crate::Instant;
 
     use super::{Event, EventQueue, KeyCode};
+
+    #[test]
+    fn future_timers_stay_cancellable_without_blocking_ready_events() {
+        let mut queue = EventQueue::new();
+        for id in [7, 8, 7] {
+            queue.push(Event::timer(Instant::from_epoch_millis(100), Some(id), || async { Ok(()) }));
+        }
+        queue.push(Event::Redraw);
+        queue.push(Event::Keyup(KeyCode::OK));
+        let now = Instant::from_epoch_millis(10);
+        assert!(matches!(queue.pop_ready(now), Some(Event::Keyup(KeyCode::OK))));
+        assert!(matches!(queue.pop_ready(now), Some(Event::Redraw)));
+        assert!(queue.pop_ready(now).is_none());
+        assert_eq!(queue.cancel_timer(7).len(), 2);
+        assert!(matches!(
+            queue.pop_ready(Instant::from_epoch_millis(100)),
+            Some(Event::Timer { id: Some(8), .. })
+        ));
+        assert!(queue.pop_ready(Instant::from_epoch_millis(100)).is_none());
+    }
 
     #[test]
     fn prioritizes_input_and_coalesces_pending_redraws() {
@@ -144,7 +198,7 @@ mod tests {
     #[test]
     fn new_input_precedes_timers_and_notifications_without_reordering_them() {
         let mut queue = EventQueue::new();
-        queue.push(Event::timer(Instant::from_epoch_millis(10), || async { Ok(()) }));
+        queue.push(Event::timer(Instant::from_epoch_millis(10), None, || async { Ok(()) }));
         queue.push(Event::Notify {
             r#type: 1,
             param1: 2,

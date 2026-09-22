@@ -1,4 +1,4 @@
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, vec};
 
 use futures::TryFutureExt;
 use jvm::{Array, ClassInstanceRef, Jvm, Result as JvmResult};
@@ -197,10 +197,9 @@ impl EventQueue {
     ) -> JvmResult<()> {
         tracing::debug!("net.wie.EventQueue::getNextEvent({this:?}, {event:?})");
 
-        let mut pending_timer_events = Vec::new();
         loop {
             let now = context.system().platform().now();
-            let maybe_event = context.system().event_queue().pop();
+            let maybe_event = context.system().event_queue().pop_ready(now);
 
             if let Some(x) = maybe_event {
                 let event_data = match x {
@@ -223,17 +222,10 @@ impl EventQueue {
                         MIDPKeyCode::from_key_code(x) as _,
                         0,
                     ],
-                    Event::Timer { due, callback } => {
-                        // TODO we should wait for timer more efficiently
-                        if due <= now {
-                            callback()
-                                .or_else(async |x| Err(jvm.exception("net/wie/WieError", &x.to_string()).await))
-                                .await?
-                        } else {
-                            // push it to event queue again
-                            pending_timer_events.push(Event::Timer { due, callback });
-                        }
-
+                    Event::Timer { callback, .. } => {
+                        callback()
+                            .or_else(async |x| Err(jvm.exception("net/wie/WieError", &x.to_string()).await))
+                            .await?;
                         continue;
                     }
                     // wipi notifyEvent
@@ -260,15 +252,7 @@ impl EventQueue {
                 }
                 Self::dispatch_callbacks(jvm, context, this.clone()).await?;
                 context.system().sleep(16).await; // TODO we need to wait for events
-
-                for event in pending_timer_events.drain(..) {
-                    context.system().event_queue().push(event);
-                }
             }
-        }
-
-        for event in pending_timer_events {
-            context.system().event_queue().push(event);
         }
 
         Ok(())
