@@ -14,7 +14,6 @@ use wie_util::Result;
 use crate::filesystem::MemoryFilesystem;
 
 static TEST_EPOCH: AtomicU64 = AtomicU64::new(0);
-static TEST_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Default)]
 pub struct TestClock {
@@ -47,6 +46,7 @@ pub struct TestPlatform {
     db: Arc<MemoryDatabaseRepository>,
     font: Font,
     clock: Option<TestClock>,
+    budget_millis: AtomicU64,
 }
 
 impl Default for TestPlatform {
@@ -64,6 +64,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: None,
+            budget_millis: AtomicU64::new(0),
         }
     }
 
@@ -78,6 +79,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: None,
+            budget_millis: AtomicU64::new(0),
         }
     }
 
@@ -89,6 +91,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: Some(clock),
+            budget_millis: AtomicU64::new(0),
         }
     }
 }
@@ -116,7 +119,7 @@ impl Platform for TestPlatform {
     }
 
     fn monotonic_millis(&self) -> u64 {
-        TEST_BUDGET.fetch_add(1, Ordering::Relaxed)
+        self.budget_millis.fetch_add(1, Ordering::Relaxed)
     }
 
     fn filesystem(&self) -> &dyn Filesystem {
