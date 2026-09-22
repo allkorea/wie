@@ -2,7 +2,7 @@ use alloc::{boxed::Box, collections::BTreeMap, collections::BTreeSet, sync::Arc,
 
 use smaf_player::{SmafEvent, parse_smaf};
 
-use crate::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSink, TimedAudioEvent};
+use crate::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSequenceId, AudioSink, TimedAudioEvent};
 
 #[derive(Debug)]
 pub enum AudioError {
@@ -11,7 +11,7 @@ pub enum AudioError {
 
 pub struct Audio {
     sink: Box<dyn AudioSink>,
-    files: BTreeMap<AudioHandle, Arc<AudioSequence>>,
+    files: BTreeMap<AudioHandle, AudioSequenceId>,
     playing: BTreeSet<AudioHandle>,
     last_audio_handle: AudioHandle,
 }
@@ -30,27 +30,30 @@ impl Audio {
         for handle in core::mem::take(&mut self.playing) {
             self.sink.send(AudioCommand::Stop { handle });
         }
-        self.files.clear();
+        for id in core::mem::take(&mut self.files).into_values() {
+            self.sink.send(AudioCommand::Unregister { id });
+        }
     }
 
     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
         let audio_handle = self.last_audio_handle;
+        self.last_audio_handle = self.last_audio_handle.checked_add(1).ok_or(AudioError::InvalidHandle)?;
+        let id = AudioSequenceId(self.last_audio_handle);
         let sequence = Arc::new(convert_smaf_events(parse_smaf(data)));
-
-        self.last_audio_handle += 1;
-        self.files.insert(audio_handle, sequence);
+        self.files.insert(audio_handle, id);
+        self.sink.send(AudioCommand::Register { id, sequence });
 
         Ok(audio_handle)
     }
 
     pub fn play(&mut self, audio_handle: AudioHandle, repeat: bool) -> Result<(), AudioError> {
-        let sequence = self.files.get(&audio_handle).cloned().ok_or(AudioError::InvalidHandle)?;
+        let id = *self.files.get(&audio_handle).ok_or(AudioError::InvalidHandle)?;
 
         self.stop(audio_handle);
         self.playing.insert(audio_handle);
         self.sink.send(AudioCommand::Play {
             handle: audio_handle,
-            sequence,
+            id,
             repeat,
         });
 
@@ -66,9 +69,8 @@ impl Audio {
     pub fn close(&mut self, audio_handle: AudioHandle) -> Result<(), AudioError> {
         self.stop(audio_handle);
 
-        if self.files.remove(&audio_handle).is_none() {
-            return Err(AudioError::InvalidHandle);
-        }
+        let id = self.files.remove(&audio_handle).ok_or(AudioError::InvalidHandle)?;
+        self.sink.send(AudioCommand::Unregister { id });
 
         Ok(())
     }
@@ -163,24 +165,27 @@ mod tests {
         audio.play(handle, true).unwrap();
 
         let commands = commands.lock().unwrap();
-        let AudioCommand::Play {
-            sequence: first_sequence,
-            repeat: false,
-            ..
-        } = &commands[0]
-        else {
-            panic!("expected initial play command");
+        let AudioCommand::Register { id, .. } = &commands[0] else {
+            panic!("expected one registration before playback");
         };
-        assert_eq!(commands[1], AudioCommand::Stop { handle });
-        let AudioCommand::Play {
-            sequence: second_sequence,
-            repeat: true,
-            ..
-        } = &commands[2]
-        else {
-            panic!("expected replay command");
-        };
-        assert!(Arc::ptr_eq(first_sequence, second_sequence));
+        assert_eq!(
+            commands[1],
+            AudioCommand::Play {
+                handle,
+                id: *id,
+                repeat: false
+            }
+        );
+        assert_eq!(commands[2], AudioCommand::Stop { handle });
+        assert_eq!(
+            commands[3],
+            AudioCommand::Play {
+                handle,
+                id: *id,
+                repeat: true
+            }
+        );
+        assert_eq!(commands.len(), 4);
     }
 
     #[test]
@@ -192,15 +197,16 @@ mod tests {
         audio.play(handle, false).unwrap();
         audio.close(handle).unwrap();
 
-        assert_eq!(commands.lock().unwrap()[1], AudioCommand::Stop { handle });
+        assert_eq!(commands.lock().unwrap()[2], AudioCommand::Stop { handle });
+        assert!(matches!(commands.lock().unwrap()[3], AudioCommand::Unregister { .. }));
         assert!(audio.play(handle, false).is_err());
 
         let next = audio.load_smaf(&[]).unwrap();
         audio.play(next, true).unwrap();
         audio.shutdown();
-        assert_eq!(commands.lock().unwrap()[3], AudioCommand::Stop { handle: next });
+        assert_eq!(commands.lock().unwrap()[6], AudioCommand::Stop { handle: next });
         assert!(audio.play(next, false).is_err());
         audio.shutdown();
-        assert_eq!(commands.lock().unwrap().len(), 4);
+        assert_eq!(commands.lock().unwrap().len(), 8);
     }
 }

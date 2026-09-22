@@ -1,170 +1,182 @@
-type MidiEvent = [time: number, kind: "midi", data: Uint8Array];
-type WaveEvent = [time: number, kind: "wave", channels: number, samplingRate: number, samples: Int16Array];
-type TransportEvent = MidiEvent | WaveEvent;
+import type { SchedulerCommand, SchedulerOutput, ScheduledEvent } from "./audio-protocol";
+import { MAX_AUDIO_BATCH, MAX_AUDIO_EVENTS, MAX_AUDIO_PLAYBACKS, MAX_AUDIO_SEQUENCES } from "./audio-protocol";
 
-type WorkerCommand =
-  | { type: "play"; handle: number; duration: number; events: TransportEvent[]; repeat: boolean }
-  | { type: "stop"; handle: number };
-
-type WorkerOutput =
-  | { type: "event"; handle: number; deadline: number; event: TransportEvent }
-  | { type: "cleanup"; handle: number; deadline: number; channels: number[]; notes: [number, number][]; immediate: boolean };
-
+type Definition = { duration: number; times: number[] };
 type Playback = {
-  duration: number;
-  events: TransportEvent[];
+  id: number;
+  token: number;
+  definition: Definition;
   repeat: boolean;
   startedAt: number;
   nextEvent: number;
+  cleanupAt?: number;
   lastScheduledAt: number;
-  cleanupAt: number | null;
-  activeNotes: Set<number>;
-  usedChannels: Set<number>;
 };
 
-const LOOKAHEAD_MS = 50;
+const definitions = new Map<number, Definition>();
 const playbacks = new Map<number, Playback>();
-const blockedUntil = new Map<number, number>();
+const LOOKAHEAD_MS = 50;
+const MAX_TICK_EVENTS = 256;
 let timer: ReturnType<typeof setTimeout> | undefined;
-
+let pausedAt: number | undefined;
 const scope = self as unknown as {
-  onmessage: ((message: MessageEvent<WorkerCommand>) => void) | null;
-  postMessage(message: WorkerOutput): void;
+  onmessage: ((message: MessageEvent<SchedulerCommand>) => void) | null;
+  postMessage(message: SchedulerOutput): void;
 };
 
-scope.onmessage = message => {
-  const command = message.data;
-  if (command.type === "play") {
-    const oldPlayback = playbacks.get(command.handle);
-    if (oldPlayback) stopPlayback(command.handle, oldPlayback);
-
-    const now = performance.now();
-    const startedAt = Math.max(now, blockedUntil.get(command.handle) ?? now);
-    blockedUntil.delete(command.handle);
-    playbacks.set(command.handle, {
-      duration: command.duration,
-      events: command.events,
-      repeat: command.repeat,
-      startedAt,
-      nextEvent: 0,
-      lastScheduledAt: startedAt,
-      cleanupAt: null,
-      activeNotes: new Set(),
-      usedChannels: new Set(),
-    });
-  } else {
-    const playback = playbacks.get(command.handle);
-    if (playback) stopPlayback(command.handle, playback);
-  }
-
-  schedule();
-};
-
-function schedule(): void {
-  if (timer !== undefined) {
-    clearTimeout(timer);
-    timer = undefined;
-  }
-
-  const now = performance.now();
-  const horizon = now + LOOKAHEAD_MS;
-
-  for (const [handle, deadline] of blockedUntil) {
-    if (deadline <= now) blockedUntil.delete(handle);
-  }
-
-  for (const [handle, playback] of playbacks) {
-    if (playback.cleanupAt !== null) {
-      if (playback.cleanupAt <= now) playbacks.delete(handle);
-      continue;
-    }
-
-    while (true) {
-      const event = playback.events[playback.nextEvent];
-      if (event) {
-        const deadline = playback.startedAt + event[0];
-        if (deadline > horizon) break;
-
-        trackMidi(playback, event);
-        playback.lastScheduledAt = Math.max(playback.lastScheduledAt, deadline);
-        playback.nextEvent++;
-        scope.postMessage({ type: "event", handle, deadline: performance.timeOrigin + deadline, event });
-        continue;
-      }
-
-      const end = playback.startedAt + playback.duration;
-      if (end > horizon) break;
-
-      playback.lastScheduledAt = Math.max(playback.lastScheduledAt, end);
-      postCleanup(handle, playback, end, false);
-      if (!playback.repeat || playback.duration === 0) {
-        if (end <= now) {
-          playbacks.delete(handle);
-        } else {
-          playback.cleanupAt = end;
-        }
-        break;
-      }
-
-      playback.activeNotes.clear();
-      playback.usedChannels.clear();
-      playback.startedAt = Math.max(end, now);
-      playback.nextEvent = 0;
-      playback.lastScheduledAt = playback.startedAt;
-    }
-  }
-
-  let nextDelay = Number.POSITIVE_INFINITY;
-  for (const playback of playbacks.values()) {
-    if (playback.cleanupAt !== null) {
-      nextDelay = Math.min(nextDelay, playback.cleanupAt - now);
-    } else {
-      const event = playback.events[playback.nextEvent];
-      const deadline = event ? playback.startedAt + event[0] : playback.startedAt + playback.duration;
-      nextDelay = Math.min(nextDelay, deadline - now - LOOKAHEAD_MS);
-    }
-  }
-  for (const deadline of blockedUntil.values()) {
-    nextDelay = Math.min(nextDelay, deadline - now);
-  }
-  if (nextDelay !== Number.POSITIVE_INFINITY) {
-    timer = setTimeout(schedule, Math.max(0, nextDelay));
-  }
-}
-
-function stopPlayback(handle: number, playback: Playback): void {
-  playbacks.delete(handle);
-  const deadline = Math.max(performance.now(), playback.lastScheduledAt) + 1;
-  blockedUntil.set(handle, deadline);
-  postCleanup(handle, playback, deadline, true);
-}
-
-function trackMidi(playback: Playback, event: TransportEvent): void {
-  if (event[1] !== "midi" || event[2].length === 0) return;
-
-  const status = event[2][0];
-  if (status < 0x80 || status >= 0xf0) return;
-
-  const channel = status & 0x0f;
-  playback.usedChannels.add(channel);
-  if (event[2].length < 2) return;
-
-  const noteKey = (channel << 8) | event[2][1];
-  if ((status & 0xf0) === 0x80 || ((status & 0xf0) === 0x90 && (event[2][2] ?? 0) === 0)) {
-    playback.activeNotes.delete(noteKey);
-  } else if ((status & 0xf0) === 0x90) {
-    playback.activeNotes.add(noteKey);
-  }
-}
-
-function postCleanup(handle: number, playback: Playback, deadline: number, immediate: boolean): void {
-  const notes = [...playback.activeNotes].map(note => [note >> 8, note & 0xff] as [number, number]);
+function cleanup(handle: number, playback: Playback, deadline: number, immediate: boolean, ended: boolean) {
   scope.postMessage({
     type: "cleanup",
     handle,
+    token: playback.token,
     deadline: performance.timeOrigin + deadline,
-    channels: [...playback.usedChannels],
-    notes,
     immediate,
+    ended,
   });
+}
+
+scope.onmessage = ({ data }) => {
+  switch (data.type) {
+    case "register":
+      if (
+        !Number.isSafeInteger(data.id) ||
+        data.id < 0 ||
+        definitions.has(data.id) ||
+        definitions.size >= MAX_AUDIO_SEQUENCES ||
+        !Number.isSafeInteger(data.duration) ||
+        data.duration < 0 ||
+        !Array.isArray(data.times) ||
+        data.times.length > MAX_AUDIO_EVENTS
+      )
+        throw new Error("Invalid audio registration");
+      for (let i = 0; i < data.times.length; i++) {
+        const time = data.times[i]!;
+        if (!Number.isSafeInteger(time) || time < (data.times[i - 1] ?? 0) || time > data.duration)
+          throw new Error("Invalid audio time");
+      }
+      definitions.set(data.id, { duration: data.duration, times: data.times });
+      return;
+    case "unregister":
+      definitions.delete(data.id);
+      for (const [handle, playback] of playbacks)
+        if (playback.id === data.id) {
+          cleanup(handle, playback, Math.max(pausedAt ?? performance.now(), playback.lastScheduledAt), true, true);
+          playbacks.delete(handle);
+        }
+      break;
+    case "pause":
+      pausedAt ??= performance.now();
+      clearTimeout(timer);
+      timer = undefined;
+      return;
+    case "resume":
+      if (pausedAt !== undefined) {
+        const elapsed = performance.now() - pausedAt;
+        for (const playback of playbacks.values()) {
+          playback.startedAt += elapsed;
+          playback.lastScheduledAt += elapsed;
+          if (playback.cleanupAt !== undefined) playback.cleanupAt += elapsed;
+        }
+        pausedAt = undefined;
+      }
+      break;
+    case "play": {
+      const definition = definitions.get(data.id);
+      if (
+        !definition ||
+        !Number.isSafeInteger(data.token) ||
+        data.token < 0 ||
+        !Number.isSafeInteger(data.handle) ||
+        data.handle < 0 ||
+        !Number.isFinite(data.notBefore) ||
+        typeof data.repeat !== "boolean" ||
+        (!playbacks.has(data.handle) && playbacks.size >= MAX_AUDIO_PLAYBACKS)
+      )
+        throw new Error("Invalid audio playback");
+      const previous = playbacks.get(data.handle);
+      if (previous)
+        cleanup(data.handle, previous, Math.max(pausedAt ?? performance.now(), previous.lastScheduledAt), true, true);
+      const startedAt = Math.max(pausedAt ?? performance.now(), data.notBefore - performance.timeOrigin);
+      playbacks.set(data.handle, {
+        id: data.id,
+        token: data.token,
+        definition,
+        repeat: data.repeat,
+        startedAt,
+        nextEvent: 0,
+        lastScheduledAt: startedAt,
+      });
+      break;
+    }
+    case "stop": {
+      const playback = playbacks.get(data.handle);
+      if (playback?.token === data.token) {
+        cleanup(data.handle, playback, Math.max(pausedAt ?? performance.now(), playback.lastScheduledAt), true, true);
+        playbacks.delete(data.handle);
+      }
+      break;
+    }
+  }
+  schedule();
+};
+
+function schedule() {
+  clearTimeout(timer);
+  timer = undefined;
+  if (pausedAt !== undefined) return;
+  const now = performance.now();
+  const horizon = now + LOOKAHEAD_MS;
+  let processed = 0;
+  let batch: ScheduledEvent[] = [];
+  const flush = () => {
+    if (batch.length) scope.postMessage({ type: "events", events: batch });
+    batch = [];
+  };
+  for (const [handle, playback] of playbacks) {
+    if (playback.cleanupAt !== undefined) {
+      if (playback.cleanupAt <= now) {
+        flush();
+        cleanup(handle, playback, playback.cleanupAt, false, true);
+        playbacks.delete(handle);
+      }
+      continue;
+    }
+    while (processed < MAX_TICK_EVENTS) {
+      const event = playback.definition.times[playback.nextEvent];
+      const deadline = playback.startedAt + (event ?? playback.definition.duration);
+      if (deadline > horizon) break;
+      processed++;
+      playback.lastScheduledAt = Math.max(playback.lastScheduledAt, deadline);
+      if (event !== undefined) {
+        batch.push({
+          handle,
+          id: playback.id,
+          token: playback.token,
+          index: playback.nextEvent++,
+          deadline: performance.timeOrigin + deadline,
+        });
+        if (batch.length === MAX_AUDIO_BATCH) flush();
+      } else {
+        flush();
+        cleanup(handle, playback, deadline, false, false);
+        if (!playback.repeat || playback.definition.duration === 0) {
+          playback.cleanupAt = deadline;
+          break;
+        }
+        playback.startedAt = Math.max(deadline, now);
+        playback.nextEvent = 0;
+      }
+    }
+  }
+  flush();
+  let delay = Infinity;
+  for (const playback of playbacks.values()) {
+    const deadline =
+      playback.cleanupAt ??
+      playback.startedAt +
+        (playback.definition.times[playback.nextEvent] ?? playback.definition.duration) -
+        LOOKAHEAD_MS;
+    delay = Math.min(delay, deadline - now);
+  }
+  if (delay !== Infinity) timer = setTimeout(schedule, Math.max(0, delay));
 }

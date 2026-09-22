@@ -358,6 +358,9 @@ impl WieWeb {
         if let Some(error) = self.window.take_error() {
             return Err(JsError::new(&alloc::format!("Canvas paint failed: {error:?}")));
         }
+        if let Some(error) = self._audio_player.0.take_error() {
+            return Err(JsError::new(&error));
+        }
         Ok(())
     }
 

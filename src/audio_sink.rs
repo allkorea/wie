@@ -95,6 +95,7 @@ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
     };
     let player = output_sink.as_ref().map(|output_sink| Player::connect_new(output_sink.mixer()));
     let mut playbacks = BTreeMap::new();
+    let mut sequences = BTreeMap::new();
 
     loop {
         let command = if let Some(deadline) = playbacks.values().map(Playback::next_deadline).min() {
@@ -112,7 +113,17 @@ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
 
         if let Some(command) = command {
             match command {
-                AudioCommand::Play { handle, sequence, repeat } => {
+                AudioCommand::Register { id, sequence } => {
+                    sequences.insert(id, sequence);
+                }
+                AudioCommand::Unregister { id } => {
+                    sequences.remove(&id);
+                }
+                AudioCommand::Play { handle, id, repeat } => {
+                    let Some(sequence) = sequences.get(&id).cloned() else {
+                        tracing::warn!(?id, "Audio sequence is not registered");
+                        continue;
+                    };
                     if let Some(mut playback) = playbacks.remove(&handle) {
                         cleanup(&mut midi_out, &mut playback);
                     }

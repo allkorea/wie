@@ -16,7 +16,7 @@ mod time;
 
 pub use self::{
     archive::{Archive, extract_zip},
-    audio_sink::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSink, TimedAudioEvent},
+    audio_sink::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSequenceId, AudioSink, TimedAudioEvent},
     canvas::Font,
     database::{Database, DatabaseRepository, RecordId},
     executor::{AsyncCallable, AsyncCallableResult},
