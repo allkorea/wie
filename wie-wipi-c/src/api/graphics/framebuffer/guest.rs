@@ -202,6 +202,7 @@ impl ImageBuffer for GuestImage<'_> {
         if width == 0 {
             return;
         }
+        let mut bytes = [0; CACHE_BYTES];
         for (row_index, row) in colors.chunks(width as usize).enumerate() {
             let py = y as i64 + row_index as i64;
             if py >= self.height as i64 {
@@ -213,8 +214,20 @@ impl ImageBuffer for GuestImage<'_> {
             let start = (-(x as i64)).clamp(0, row.len() as i64) as usize;
             let end = (self.width as i64 - x as i64).clamp(0, row.len() as i64) as usize;
             if start < end {
-                for (column, &color) in row[start..end].iter().enumerate() {
-                    self.put_pixel((x as i64 + start as i64 + column as i64) as i32, py as i32, color);
+                let mut offset = py as usize * self.stride + (x as i64 + start as i64) as usize * self.bpp;
+                for colors in row[start..end].chunks(CACHE_BYTES / self.bpp) {
+                    let bytes = &mut bytes[..colors.len() * self.bpp];
+                    if self.bpp == 2 {
+                        for (pixel, &color) in bytes.chunks_exact_mut(2).zip(colors) {
+                            pixel.copy_from_slice(&Rgb565Pixel::from_color(color).to_le_bytes());
+                        }
+                    } else {
+                        for (pixel, &color) in bytes.chunks_exact_mut(4).zip(colors) {
+                            pixel.copy_from_slice(&ArgbPixel::from_color(color).to_le_bytes());
+                        }
+                    }
+                    self.pixels.get_mut().write(offset, bytes);
+                    offset += bytes.len();
                 }
             }
         }
