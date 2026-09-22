@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::ToString, vec};
+use alloc::{string::ToString, vec};
 
 mod context;
 pub(super) mod graphics;
@@ -8,11 +8,11 @@ use wipi_types::lgt::CletFunctions;
 use wipi_types::wipic::WIPICIndirectPtr;
 
 use wie_backend::System;
-use wie_core_arm::{ArmCore, EmulatedFunction, EmulatedFunctionParam, ResultWriter, SvcId};
+use wie_core_arm::{ArmCore, EmulatedFunction, ResultWriter, SvcId};
 use wie_jvm_support::JvmSupport;
 use wie_util::{Result, read_generic, write_generic, write_null_terminated_string_bytes};
 use wie_wipi_c::{
-    MethodImpl, WIPICContext, WIPICMethodBody, WIPICResult,
+    MethodImpl, WIPICContext,
     api::{database, graphics as shared_graphics, im, kernel, media, misc, net},
 };
 
@@ -22,26 +22,8 @@ use crate::runtime::{SVC_CATEGORY_WIPIC, svc_ids::WIPICSvcId};
 
 const TIME_VALUE_PTR: u32 = 0x7fff1004;
 
-struct WIPICMethodResult {
-    result: WIPICResult,
-}
-
-impl ResultWriter<WIPICMethodResult> for WIPICMethodResult {
-    fn write(self, core: &mut ArmCore, next_pc: u32) -> Result<()> {
-        core.write_return_value(&self.result.results)?;
-        core.set_next_pc(next_pc)?;
-
-        Ok(())
-    }
-}
-
-struct CMethodProxy {
-    context: LgtWIPICContext,
-    body: WIPICMethodBody,
-}
-
 async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm), id: SvcId) -> Result<()> {
-    let wipic_context = LgtWIPICContext::new(core.clone(), system.clone(), jvm.clone());
+    let mut wipic_context = LgtWIPICContext::new(core.clone(), system.clone(), jvm.clone());
     let (_, lr) = core.read_pc_lr()?;
     let method = match WIPICSvcId::try_from(id)? {
         WIPICSvcId::CletRegister => {
@@ -151,38 +133,13 @@ async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm),
         WIPICSvcId::Unk16 => unk16.into_body(),
     };
 
-    EmulatedFunction::call(
-        &CMethodProxy {
-            context: wipic_context,
-            body: method,
-        },
-        core,
-        &mut (),
-    )
-    .await?
-    .write(core, lr)
-}
-
-#[async_trait::async_trait]
-impl EmulatedFunction<(), WIPICMethodResult, ()> for CMethodProxy {
-    async fn call(&self, core: &mut ArmCore, _: &mut ()) -> Result<WIPICMethodResult> {
-        let a0 = u32::get(core, 0);
-        let a1 = u32::get(core, 1);
-        let a2 = u32::get(core, 2);
-        let a3 = u32::get(core, 3);
-        let a4 = u32::get(core, 4);
-        let a5 = u32::get(core, 5);
-        let a6 = u32::get(core, 6);
-        let a7 = u32::get(core, 7);
-        let a8 = u32::get(core, 8);
-
-        let result = self
-            .body
-            .call(&mut self.context.clone(), vec![a0, a1, a2, a3, a4, a5, a6, a7, a8].into_boxed_slice())
-            .await?;
-
-        Ok(WIPICMethodResult { result })
+    let mut args = [0; 9];
+    for (index, arg) in args.iter_mut().enumerate() {
+        *arg = core.read_param(index)?;
     }
+    let result = method.call(&mut wipic_context, &args).await?;
+    core.write_return_value(&result.results)?;
+    core.set_next_pc(lr)
 }
 
 pub fn register_wipic_svc_handler(core: &mut ArmCore, system: &System, jvm: &Jvm) -> Result<()> {

@@ -75,7 +75,7 @@ impl WIPICContext for KtfWIPICContext {
         impl AsyncCallable<Result<()>> for SpawnProxy {
             async fn call(mut self) -> Result<()> {
                 self.context.jvm.attach_thread(None).await.unwrap();
-                self.callback.call(&mut self.context, Box::new([])).await?;
+                self.callback.call(&mut self.context, &[]).await?;
                 self.context.jvm.detach_thread().unwrap();
 
                 Ok(())
@@ -156,7 +156,7 @@ impl WIPICContext for KtfWIPICContext {
             let mut context = context.clone();
 
             async move {
-                callback.call(&mut context, Box::new([])).await?;
+                callback.call(&mut context, &[]).await?;
                 Ok(())
             }
         }))

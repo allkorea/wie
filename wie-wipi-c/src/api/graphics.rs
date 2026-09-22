@@ -673,7 +673,6 @@ pub async fn get_framebuffer_bpp(context: &mut dyn WIPICContext, framebuffer: WI
 
 #[cfg(test)]
 mod tests {
-    use alloc::boxed::Box;
 
     use crate::{MethodImpl, context::test::TestContext};
 
@@ -699,9 +698,9 @@ mod tests {
             (7, 8),
             (8, 1),
         ] {
-            set.call(&mut context, Box::new([ptr_context, op, value])).await?;
+            set.call(&mut context, &[ptr_context, op, value]).await?;
             write_generic(&mut context, output, [0xccccccccu32; 5])?;
-            get.call(&mut context, Box::new([ptr_context, op, output])).await?;
+            get.call(&mut context, &[ptr_context, op, output]).await?;
             assert_eq!(
                 read_generic::<[u32; 5], _>(&context, output)?,
                 [value, 0xcccccccc, 0xcccccccc, 0xcccccccc, 0xcccccccc]
@@ -709,18 +708,18 @@ mod tests {
         }
 
         write_generic(&mut context, input, [-5i32, -8, 176, 220])?;
-        set.call(&mut context, Box::new([ptr_context, 0, input])).await?;
+        set.call(&mut context, &[ptr_context, 0, input]).await?;
         write_generic(&mut context, output, [999i32; 5])?;
-        get.call(&mut context, Box::new([ptr_context, 0, output])).await?;
+        get.call(&mut context, &[ptr_context, 0, output]).await?;
         assert_eq!(read_generic::<[i32; 5], _>(&context, output)?, [-5, -8, 176, 220, 999]);
 
         write_generic(&mut context, input, [-12i32, 34])?;
-        set.call(&mut context, Box::new([ptr_context, 10, input])).await?;
+        set.call(&mut context, &[ptr_context, 10, input]).await?;
         write_generic(&mut context, output, [999i32; 5])?;
-        get.call(&mut context, Box::new([ptr_context, 10, output])).await?;
+        get.call(&mut context, &[ptr_context, 10, output]).await?;
         assert_eq!(read_generic::<[i32; 5], _>(&context, output)?, [-12, 34, 999, 999, 999]);
 
-        get.call(&mut context, Box::new([ptr_context, 0xff, output])).await?;
+        get.call(&mut context, &[ptr_context, 0xff, output]).await?;
         assert_eq!(read_generic::<[i32; 5], _>(&context, output)?, [-12, 34, 999, 999, 999]);
         Ok(())
     }

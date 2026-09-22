@@ -17,7 +17,7 @@ pub async fn connect(context: &mut dyn WIPICContext, cb: WIPICWord, param: WIPIC
     #[async_trait::async_trait]
     impl MethodBody<WieError> for ConnectCallback {
         #[tracing::instrument(name = "timer", skip_all)]
-        async fn call(&self, context: &mut dyn WIPICContext, _: Box<[WIPICWord]>) -> Result<WIPICResult> {
+        async fn call(&self, context: &mut dyn WIPICContext, _: &[WIPICWord]) -> Result<WIPICResult> {
             context.system().sleep(1).await; // simulate some delay
 
             context.call_function(self.cb, &[u32::MAX, self.param]).await?; // callback with M_E_ERROR
