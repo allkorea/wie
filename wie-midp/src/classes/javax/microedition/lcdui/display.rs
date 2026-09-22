@@ -503,7 +503,7 @@ impl Display {
 
         let due = context.system().platform().now() + timeout as u64;
         let timer_jvm = jvm.clone();
-        context.system().event_queue().push(Event::timer(due, move || {
+        context.system().event_queue().push(Event::timer(due, None, move || {
             let jvm = timer_jvm;
             async move {
                 let result: JvmResult<()> = async {
@@ -618,7 +618,7 @@ impl Display {
 
         let due = context.system().platform().now() + TICKER_INTERVAL_MS;
         let timer_jvm = jvm.clone();
-        context.system().event_queue().push(Event::timer(due, move || {
+        context.system().event_queue().push(Event::timer(due, None, move || {
             let jvm = timer_jvm;
             async move {
                 let result: JvmResult<()> = async {
@@ -1078,6 +1078,7 @@ impl Display {
                 .invoke_virtual(&current, "javax/microedition/lcdui/Displayable", "decorationChanged", "()V", ())
                 .await?;
         } else {
+            jvm.put_field(&mut this, "repaintPending", "Z", true).await?;
             let platform = context.system().platform();
             platform.screen().request_redraw().unwrap();
         }

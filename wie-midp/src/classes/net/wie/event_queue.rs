@@ -1,4 +1,4 @@
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, vec};
 
 use futures::TryFutureExt;
 use jvm::{Array, ClassInstanceRef, Jvm, Result as JvmResult};
@@ -197,10 +197,9 @@ impl EventQueue {
     ) -> JvmResult<()> {
         tracing::debug!("net.wie.EventQueue::getNextEvent({this:?}, {event:?})");
 
-        let mut pending_timer_events = Vec::new();
         loop {
             let now = context.system().platform().now();
-            let maybe_event = context.system().event_queue().pop();
+            let maybe_event = context.system().event_queue().pop_ready(now);
 
             if let Some(x) = maybe_event {
                 let event_data = match x {
@@ -223,17 +222,10 @@ impl EventQueue {
                         MIDPKeyCode::from_key_code(x) as _,
                         0,
                     ],
-                    Event::Timer { due, callback } => {
-                        // TODO we should wait for timer more efficiently
-                        if due <= now {
-                            callback()
-                                .or_else(async |x| Err(jvm.exception("net/wie/WieError", &x.to_string()).await))
-                                .await?
-                        } else {
-                            // push it to event queue again
-                            pending_timer_events.push(Event::Timer { due, callback });
-                        }
-
+                    Event::Timer { callback, .. } => {
+                        callback()
+                            .or_else(async |x| Err(jvm.exception("net/wie/WieError", &x.to_string()).await))
+                            .await?;
                         continue;
                     }
                     // wipi notifyEvent
@@ -260,15 +252,7 @@ impl EventQueue {
                 }
                 Self::dispatch_callbacks(jvm, context, this.clone()).await?;
                 context.system().sleep(16).await; // TODO we need to wait for events
-
-                for event in pending_timer_events.drain(..) {
-                    context.system().event_queue().push(event);
-                }
             }
-        }
-
-        for event in pending_timer_events {
-            context.system().event_queue().push(event);
         }
 
         Ok(())
@@ -307,7 +291,7 @@ impl EventQueue {
         match event_kind {
             EventQueueEvent::RepaintEvent => {
                 let _: () = jvm
-                    .invoke_virtual(&display, "javax/microedition/lcdui/Display", "handlePaintEvent", "()V", ())
+                    .invoke_virtual(&display, "javax/microedition/lcdui/Display", "serviceRepaints", "()V", ())
                     .await?;
                 Self::dispatch_callbacks(jvm, context, this).await?;
             }
@@ -699,8 +683,8 @@ mod test {
                 }
                 jvm.put_field(&mut callback, "repaintOnPaint", "Z", false).await?;
                 jvm.put_field(&mut callback, "repeat", "Z", false).await?;
-                for paint_count in 3..=4 {
-                    // First finish the callbacks, then repaint with no pending request or callback.
+                for _ in 0..2 {
+                    // A queued redraw must not repeat a paint already serviced.
                     system.event_queue().push(Event::Redraw);
                     let _: () = jvm
                         .invoke_virtual(&queue, "net/wie/EventQueue", "getNextEvent", "([I)V", (event.clone(),))
@@ -709,9 +693,24 @@ mod test {
                         .invoke_virtual(&queue, "net/wie/EventQueue", "dispatchEvent", "([I)V", (event.clone(),))
                         .await?;
                     assert_eq!(jvm.get_field::<i32>(&callback, "count", "I").await?, 6);
-                    assert_eq!(jvm.get_field::<i32>(&callback, "paintCount", "I").await?, paint_count);
+                    assert_eq!(jvm.get_field::<i32>(&callback, "paintCount", "I").await?, 3);
                     assert!(!jvm.get_field::<bool>(&display, "repaintPending", "Z").await?);
                 }
+                let _: () = jvm
+                    .invoke_virtual(&display, "javax/microedition/lcdui/Display", "repaint", "(IIII)V", (0, 0, 240, 320))
+                    .await?;
+                let _: () = jvm
+                    .invoke_virtual(&display, "javax/microedition/lcdui/Display", "serviceRepaints", "()V", ())
+                    .await?;
+                assert_eq!(jvm.get_field::<i32>(&callback, "paintCount", "I").await?, 4);
+                system.event_queue().push(Event::Redraw);
+                let _: () = jvm
+                    .invoke_virtual(&queue, "net/wie/EventQueue", "getNextEvent", "([I)V", (event.clone(),))
+                    .await?;
+                let _: () = jvm
+                    .invoke_virtual(&queue, "net/wie/EventQueue", "dispatchEvent", "([I)V", (event.clone(),))
+                    .await?;
+                assert_eq!(jvm.get_field::<i32>(&callback, "paintCount", "I").await?, 4);
                 Ok(())
             },
         )

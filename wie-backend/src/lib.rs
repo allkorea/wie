@@ -1,6 +1,7 @@
 #![no_std]
 extern crate alloc;
 
+mod archive;
 mod audio_sink;
 pub mod canvas;
 mod database;
@@ -14,7 +15,8 @@ pub mod text_layout;
 mod time;
 
 pub use self::{
-    audio_sink::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSink, TimedAudioEvent},
+    archive::{Archive, extract_zip},
+    audio_sink::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSequenceId, AudioSink, TimedAudioEvent},
     canvas::Font,
     database::{Database, DatabaseRepository, RecordId},
     executor::{AsyncCallable, AsyncCallableResult},
@@ -26,19 +28,14 @@ pub use self::{
     time::Instant,
 };
 
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    format,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, vec::Vec};
 
-use wie_util::{Result, WieError};
+use wie_util::Result;
 
 pub trait Emulator {
     fn handle_event(&mut self, event: Event);
-    fn tick(&mut self) -> Result<()>;
+    /// Runs a bounded slice; true requests another turn after yielding to the host.
+    fn tick(&mut self) -> Result<bool>;
 }
 
 pub struct ProfileSample {
@@ -55,32 +52,4 @@ pub type ProfileCallback = Box<dyn FnMut(Vec<ProfileSample>) + Send + Sync>;
 pub struct Options {
     pub enable_gdbserver: bool,
     pub profile: Option<ProfileCallback>,
-}
-
-pub fn extract_zip(zip: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
-    extern crate std; // XXX
-
-    use std::io::{Cursor, Read};
-    use zip::ZipArchive;
-
-    let mut archive = ZipArchive::new(Cursor::new(zip)).map_err(|x| WieError::FatalError(format!("Invalid zip archive: {x}")))?;
-
-    (0..archive.len())
-        .filter_map(|x| {
-            let mut file = match archive.by_index(x) {
-                Ok(file) => file,
-                Err(err) => return Some(Err(WieError::FatalError(format!("Failed to read zip entry {x}: {err}")))),
-            };
-            if !file.is_file() {
-                return None;
-            }
-
-            let mut data = Vec::new();
-            if let Err(err) = file.read_to_end(&mut data) {
-                return Some(Err(WieError::FatalError(format!("Failed to read zip entry {}: {err}", file.name()))));
-            }
-
-            Some(Ok((file.name().to_string(), data)))
-        })
-        .collect::<Result<_>>()
 }

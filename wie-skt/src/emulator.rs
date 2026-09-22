@@ -22,6 +22,12 @@ pub struct SktEmulator {
     system: System,
 }
 
+impl Drop for SktEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+    }
+}
+
 impl SktEmulator {
     pub fn from_archive(platform: Box<dyn Platform>, files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
         let msd_file = files.iter().find(|x| x.0.ends_with(".msd")).unwrap();
@@ -164,7 +170,7 @@ impl Emulator for SktEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick()
     }
 }

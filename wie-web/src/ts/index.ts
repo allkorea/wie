@@ -34,17 +34,18 @@ const main = async () => {
       libraryView.hidden = true;
       playerView.hidden = false;
 
-      let disposeApp: () => void;
+      let disposeApp: () => Promise<void>;
+      let closing = false;
       const routeToLibrary = (error?: unknown) => {
-        disposeApp();
-        playerView.hidden = true;
-        libraryView.hidden = false;
-
-        if (error !== undefined) {
-          reject(error);
-        } else {
-          resolve();
-        }
+        if (closing) return;
+        closing = true;
+        void disposeApp().then(
+          () => { if (error !== undefined) reject(error); else resolve(); },
+          reject,
+        ).finally(() => {
+          playerView.hidden = true;
+          libraryView.hidden = false;
+        });
       };
 
       try {

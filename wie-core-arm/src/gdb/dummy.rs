@@ -42,10 +42,12 @@ impl ConnectionExt for DummyConnection {
 pub(crate) fn start(core: ArmCore) -> wie_util::Result<()> {
     let mut target = GdbTarget::new(core);
     // Fail during connection initialization, before waiting for a guest thread.
-    GdbStub::new(DummyConnection)
+    let result = GdbStub::new(DummyConnection)
         .run_blocking::<GdbBlockingEventLoop<DummyConnection>>(&mut target)
-        .map_err(|err| wie_util::WieError::FatalError(format!("{err}")))?;
-    target.debug.detach()
+        .map_err(|err| wie_util::WieError::FatalError(format!("{err}")))
+        .and_then(|_| target.debug.detach());
+    target.debug.shutdown();
+    result
 }
 
 #[cfg(test)]

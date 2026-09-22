@@ -12,7 +12,7 @@ use wie_jvm_support::JvmSupport;
 use wie_util::{Result, WieError, write_generic};
 
 use crate::{
-    adf::{KtfAdf, find_client_bin},
+    adf::KtfAdf,
     runtime::{KtfJvmSupport, KtfJvmThreadContext},
 };
 
@@ -26,11 +26,37 @@ struct KtfTaskRunner {
     core: ArmCore,
 }
 
+struct KtfThreadContextAllocation {
+    core: ArmCore,
+    address: Option<u32>,
+}
+
+impl KtfThreadContextAllocation {
+    fn release(&mut self) -> Result<()> {
+        if let Some(address) = self.address.take() {
+            Allocator::free(&mut self.core, address, size_of::<KtfJvmThreadContext>() as u32)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for KtfThreadContextAllocation {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            tracing::error!("Failed to free KTF thread context: {error}");
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl TaskRunner for KtfTaskRunner {
     async fn run(&self, mut future: Pin<Box<dyn Future<Output = Result<()>> + Send>>) -> Result<()> {
         let mut core = self.core.clone();
         let ptr_thread_context = Allocator::alloc(&mut core, size_of::<KtfJvmThreadContext>() as u32)?;
+        let mut allocation = KtfThreadContextAllocation {
+            core: core.clone(),
+            address: Some(ptr_thread_context),
+        };
         write_generic(&mut core, ptr_thread_context, KtfJvmThreadContext::zeroed())?;
 
         let mut poll_core = self.core.clone();
@@ -48,7 +74,7 @@ impl TaskRunner for KtfTaskRunner {
             })?
             .await;
 
-        Allocator::free(&mut core, ptr_thread_context, size_of::<KtfJvmThreadContext>() as u32)?;
+        allocation.release()?;
 
         result
     }
@@ -57,6 +83,14 @@ impl TaskRunner for KtfTaskRunner {
 pub struct KtfEmulator {
     core: ArmCore,
     system: System,
+}
+
+impl Drop for KtfEmulator {
+    fn drop(&mut self) {
+        self.core.stop_debugger();
+        self.system.shutdown();
+        self.core.shutdown();
+    }
 }
 
 impl KtfEmulator {
@@ -75,7 +109,7 @@ impl KtfEmulator {
 
         let jar_filename = format!("{}.jar", adf.aid);
 
-        Self::load(platform, &jar_filename, &adf.pid, &adf.aid, Some(adf.mclass), &files, options)
+        Self::load(platform, &jar_filename, &adf.pid, &adf.aid, Some(adf.mclass), files, options)
     }
 
     pub fn from_jar(
@@ -89,7 +123,7 @@ impl KtfEmulator {
     ) -> Result<Self> {
         let files = [(jar_filename.to_owned(), jar)].into_iter().collect();
 
-        Self::load(platform, jar_filename, pid, aid, main_class_name, &files, options)
+        Self::load(platform, jar_filename, pid, aid, main_class_name, files, options)
     }
 
     pub fn loadable_archive(files: &BTreeMap<String, Vec<u8>>) -> bool {
@@ -111,7 +145,7 @@ impl KtfEmulator {
     }
 
     pub fn loadable_jar(jar: &[u8]) -> bool {
-        find_client_bin(jar).is_ok()
+        wie_backend::Archive::new(jar).is_ok_and(|archive| archive.names().any(|name| name.starts_with("client.bin")))
     }
 
     fn load(
@@ -120,7 +154,7 @@ impl KtfEmulator {
         pid: &str,
         aid: &str,
         main_class_name: Option<String>,
-        files: &BTreeMap<String, Vec<u8>>,
+        files: BTreeMap<String, Vec<u8>>,
         mut options: Options,
     ) -> Result<Self> {
         let mut core = ArmCore::new(options.enable_gdbserver, options.profile.take())?;
@@ -128,7 +162,7 @@ impl KtfEmulator {
 
         for (path, data) in files {
             let path = path.trim_start_matches("P/");
-            system.filesystem().add_virtual(path, data.clone());
+            system.filesystem().add_virtual(path, data);
         }
 
         Allocator::init(&mut core)?;
@@ -191,7 +225,7 @@ impl Emulator for KtfEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick().map_err(|x| {
             let reg_stack = self.core.dump_reg_stack(IMAGE_BASE);
             match x {
@@ -205,14 +239,17 @@ impl Emulator for KtfEmulator {
 #[cfg(test)]
 mod tests {
     use alloc::{boxed::Box, sync::Arc};
-    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use core::{
+        mem::size_of,
+        sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    };
 
     use test_utils::TestPlatform;
     use wie_backend::{System, YieldFuture};
     use wie_core_arm::{Allocator, ArmCore};
     use wie_util::{Result, WieError};
 
-    use super::{KtfJvmSupport, KtfTaskRunner};
+    use super::{KtfJvmSupport, KtfJvmThreadContext, KtfTaskRunner};
 
     #[test]
     fn clet_mode_is_selected_from_adf_mclass() {
@@ -258,6 +295,23 @@ mod tests {
         assert_ne!(first, 0);
         assert_ne!(second, 0);
         assert_ne!(first, second);
+
+        let pending_context = Arc::new(AtomicU32::new(0));
+        let observed = pending_context.clone();
+        let pending_core = core.clone();
+        system.spawn(async move || {
+            observed.store(KtfJvmSupport::current_thread_context(&pending_core)?, Ordering::Relaxed);
+            core::future::pending::<Result<()>>().await
+        });
+        system.tick()?;
+        let address = pending_context.load(Ordering::Relaxed);
+        let context_size = size_of::<KtfJvmThreadContext>() as u32;
+        assert_ne!(address, 0);
+        assert!(Allocator::is_allocated(&core, address, context_size)?);
+        system.shutdown();
+        assert!(!Allocator::is_allocated(&core, address, context_size)?);
+        assert!(core.get_thread_ids().is_empty());
+        core.shutdown();
 
         Ok(())
     }

@@ -1,4 +1,4 @@
-import { WieWeb } from "@pkg";
+import { WieWeb, flushStorage } from "@pkg";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Settings, createIcons } from "lucide";
 
 import { AppMetadata } from "./app_library_store";
@@ -121,10 +121,14 @@ export const runApp = (app: AppMetadata, archive: Uint8Array, fontData: Uint8Arr
   };
   requestAnimationFrame(update);
 
-  return () => {
+  return async () => {
     running = false;
     abortController.abort();
     unsubscribePcmVolume();
-    wieWeb.free();
+    try {
+      wieWeb.free();
+    } finally {
+      await flushStorage();
+    }
   };
 };

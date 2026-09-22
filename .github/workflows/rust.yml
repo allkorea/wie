@@ -55,6 +55,14 @@ jobs:
       - run: cargo clippy --target wasm32-unknown-unknown --workspace --exclude wie-app -- -D warnings
       - run: cargo test --all
 
+      - name: Build native release
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: cargo build --locked --release -p wie
+
+      - name: Build WASM release
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: cargo build --locked --release -p wie-web --target wasm32-unknown-unknown
+
       - name: Save cache cargo
         uses: actions/cache/save@v6
         if: github.ref == 'refs/heads/main'

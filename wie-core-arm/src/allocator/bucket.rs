@@ -5,6 +5,7 @@ use wie_util::{ByteRead, ByteWrite, Result, WieError};
 use crate::core::ArmCore;
 
 pub const BUCKET_MAX: usize = 512;
+const HEADER_SCAN_BYTES: usize = 256;
 
 // (slot_size, slot_count). slot_count is a multiple of 8 so the header has no
 // trailing partial byte to mask. Sizes chosen generously per slot class to fit
@@ -73,22 +74,24 @@ impl BucketAllocator {
         let (slot_size, _) = BUCKETS[bucket_index];
         let header_address = base_address + region_offset(bucket_index) as u32;
         let header_len = header_length(bucket_index);
+        let mut header = [0u8; HEADER_SCAN_BYTES];
 
-        let mut header = vec![0u8; header_len];
-        core.read_bytes(header_address, &mut header)?;
+        for offset in (0..header_len).step_by(HEADER_SCAN_BYTES) {
+            let len = (header_len - offset).min(HEADER_SCAN_BYTES);
+            core.read_bytes(header_address + offset as u32, &mut header[..len])?;
 
-        for (i, item) in header.iter_mut().enumerate() {
-            if *item == 0 {
-                continue;
+            for (i, &item) in header[..len].iter().enumerate() {
+                if item == 0 {
+                    continue;
+                }
+
+                let bit = item.trailing_zeros();
+                let index = (offset + i) as u32;
+                let address = header_address + header_len as u32 + (index * 8 + bit) * slot_size as u32;
+                core.write_bytes(header_address + index, &[item & !(1 << bit)])?;
+
+                return Ok(address);
             }
-
-            let bit = item.trailing_zeros();
-            *item &= !(1 << bit);
-            let address = header_address + header_len as u32 + (i as u32 * 8 + bit) * slot_size as u32;
-
-            core.write_bytes(header_address + i as u32, &[*item])?;
-
-            return Ok(address);
         }
 
         Err(WieError::AllocationFailure)
@@ -96,22 +99,26 @@ impl BucketAllocator {
 
     pub fn free(core: &mut ArmCore, base_address: u32, address: u32, size: u32) -> Result<()> {
         let bucket_index = Self::find_bucket_index(size);
-        let (slot_size, _) = BUCKETS[bucket_index];
+        let (slot_size, slot_count) = BUCKETS[bucket_index];
         let header_address = base_address + region_offset(bucket_index) as u32;
         let header_len = header_length(bucket_index);
 
-        let mut header = vec![0u8; header_len];
-        core.read_bytes(header_address, &mut header)?;
+        let offset = address
+            .checked_sub(header_address + header_len as u32)
+            .ok_or(WieError::InvalidMemoryAccess(address))?;
+        if offset % slot_size as u32 != 0 || offset / slot_size as u32 >= slot_count as u32 {
+            return Err(WieError::InvalidMemoryAccess(address));
+        }
 
-        let offset = (address - header_address - header_len as u32) / slot_size as u32;
-        let index = offset / 8;
-        let bit = offset % 8;
+        let slot = offset / slot_size as u32;
+        let index = slot / 8;
+        let bit = slot % 8;
+        let mut header = [0u8; 1];
+        core.read_bytes(header_address + index, &mut header)?;
 
-        debug_assert!(header[index as usize] & (1 << bit) == 0);
-
-        header[index as usize] |= 1 << bit;
-
-        core.write_bytes(header_address + index, &[header[index as usize]])?;
+        debug_assert!(header[0] & (1 << bit) == 0);
+        header[0] |= 1 << bit;
+        core.write_bytes(header_address + index, &header)?;
 
         Ok(())
     }
@@ -145,11 +152,11 @@ impl BucketAllocator {
 
 #[cfg(test)]
 mod tests {
-    use wie_util::Result;
+    use wie_util::{ByteWrite, Result, WieError};
 
     use crate::ArmCore;
 
-    use super::BucketAllocator;
+    use super::{BUCKETS, BucketAllocator, HEADER_SCAN_BYTES, header_length, region_offset};
 
     // Bucket 0 (4-byte): header_length = 0x100000 / 8 = 0x20000.
     //   First slot at base + 0x20000 = 0x40020000.
@@ -223,6 +230,44 @@ mod tests {
         BucketAllocator::free(&mut core, 0x40000000, a1, 1)?;
         let a1b = BucketAllocator::alloc(&mut core, 0x40000000, 1)?;
         assert_eq!(a1b, 0x40020004);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_allocator_scan_boundaries() -> Result<()> {
+        let base = 0x40000000;
+        let mut core = ArmCore::new(false, None)?;
+        core.map(base, 0x8000000)?;
+        BucketAllocator::init(&mut core, base, 0x8000000)?;
+
+        for (bucket_index, &(slot_size, slot_count)) in BUCKETS.iter().enumerate() {
+            let header_address = base + region_offset(bucket_index) as u32;
+            let header_len = header_length(bucket_index);
+            let data_address = header_address + header_len as u32;
+            core.write_bytes(header_address, &alloc::vec![0; header_len])?;
+
+            for index in [0, HEADER_SCAN_BYTES - 1, HEADER_SCAN_BYTES, header_len - 1] {
+                core.write_bytes(header_address + index as u32, &[0b1000_0010])?;
+                for bit in [1, 7] {
+                    let expected = data_address + (index as u32 * 8 + bit) * slot_size as u32;
+                    assert_eq!(BucketAllocator::alloc(&mut core, base, slot_size as u32)?, expected);
+                    BucketAllocator::free(&mut core, base, expected, slot_size as u32)?;
+                    assert_eq!(BucketAllocator::alloc(&mut core, base, slot_size as u32)?, expected);
+                }
+            }
+
+            assert!(matches!(
+                BucketAllocator::alloc(&mut core, base, slot_size as u32),
+                Err(WieError::AllocationFailure)
+            ));
+            for address in [data_address - 1, data_address + 1, data_address + (slot_size * slot_count) as u32] {
+                assert!(matches!(
+                    BucketAllocator::free(&mut core, base, address, slot_size as u32),
+                    Err(WieError::InvalidMemoryAccess(_))
+                ));
+            }
+        }
 
         Ok(())
     }

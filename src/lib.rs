@@ -41,6 +41,7 @@ struct WieCliPlatform {
     filesystem: CliFilesystem,
     font: Font,
     window: WindowHandle,
+    clock_origin: std::time::Instant,
 }
 
 impl WieCliPlatform {
@@ -54,6 +55,7 @@ impl WieCliPlatform {
             filesystem: CliFilesystem::new(),
             font,
             window,
+            clock_origin: std::time::Instant::now(),
         }
     }
 }
@@ -76,6 +78,10 @@ impl Platform for WieCliPlatform {
 
     fn database_repository(&self) -> &dyn wie_backend::DatabaseRepository {
         &self.database_repository
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        self.clock_origin.elapsed().as_millis() as u64
     }
 
     fn filesystem(&self) -> &dyn Filesystem {
@@ -243,7 +249,7 @@ fn start(filename: &str, options: Options, midi_device: Option<usize>) -> anyhow
                     }
                 }
 
-                emulator.tick()?
+                emulator.tick()?;
             }
             WindowCallbackEvent::Redraw => emulator.handle_event(Event::Redraw),
             WindowCallbackEvent::Keydown(x) => {

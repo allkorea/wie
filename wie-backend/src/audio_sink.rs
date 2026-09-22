@@ -2,15 +2,25 @@ use alloc::{sync::Arc, vec::Vec};
 
 pub type AudioHandle = u32;
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AudioSequenceId(pub u32);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioCommand {
+    Register {
+        id: AudioSequenceId,
+        sequence: Arc<AudioSequence>,
+    },
     Play {
         handle: AudioHandle,
-        sequence: Arc<AudioSequence>,
+        id: AudioSequenceId,
         repeat: bool,
     },
     Stop {
         handle: AudioHandle,
+    },
+    Unregister {
+        id: AudioSequenceId,
     },
 }
 

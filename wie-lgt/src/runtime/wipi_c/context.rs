@@ -72,7 +72,7 @@ impl WIPICContext for LgtWIPICContext {
         impl AsyncCallable<Result<()>> for SpawnProxy {
             async fn call(mut self) -> Result<()> {
                 self.context.jvm.attach_thread(None).await.unwrap();
-                self.callback.call(&mut self.context, Box::new([])).await?;
+                self.callback.call(&mut self.context, &[]).await?;
                 self.context.jvm.detach_thread().unwrap();
 
                 Ok(())
@@ -101,7 +101,7 @@ impl WIPICContext for LgtWIPICContext {
         }
         self.jvm.collect_garbage().unwrap();
 
-        Ok(self.system.filesystem().size(name).await)
+        self.system.filesystem().size(name).await
     }
 
     async fn read_resource(&self, name: &str) -> Result<Vec<u8>> {
@@ -112,11 +112,11 @@ impl WIPICContext for LgtWIPICContext {
             return Ok(JavaIoInputStream::read_until_end(&self.jvm, &stream).await.unwrap());
         }
 
-        let Some(size) = self.system.filesystem().size(name).await else {
+        let Some(size) = self.system.filesystem().size(name).await? else {
             return Err(WieError::FatalError(format!("Missing resource: {name}")));
         };
         let mut data = vec![0; size];
-        let read = self.system.filesystem().read(name, 0, size, &mut data).await.unwrap_or(0);
+        let read = self.system.filesystem().read(name, 0, size, &mut data).await?.unwrap_or(0);
         data.truncate(read);
 
         self.jvm.collect_garbage().unwrap();
@@ -124,14 +124,14 @@ impl WIPICContext for LgtWIPICContext {
         Ok(data)
     }
 
-    fn set_timer(&mut self, due: Instant, callback: WIPICMethodBody) {
+    fn set_timer(&mut self, timer: WIPICWord, due: Instant, callback: WIPICMethodBody) {
         let context = self.clone();
 
-        self.system().event_queue().push(Event::timer(due, move || {
+        self.system().event_queue().push(Event::timer(due, Some(timer), move || {
             let mut context = context.clone();
 
             async move {
-                callback.call(&mut context, Box::new([])).await?;
+                callback.call(&mut context, &[]).await?;
                 Ok(())
             }
         }))

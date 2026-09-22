@@ -15,7 +15,7 @@ use jvm::{
     runtime::{JavaIoInputStream, JavaLangClassLoader},
 };
 
-use wie_backend::{Emulator, Event, Options, Platform, System, TaskRunner, extract_zip};
+use wie_backend::{Archive, Emulator, Event, Options, Platform, System, TaskRunner};
 use wie_core_arm::{Allocator, ArmCore};
 use wie_jvm_support::JvmSupport;
 use wie_util::{Result, WieError};
@@ -36,6 +36,14 @@ impl TaskRunner for LgtTaskRunner {
 pub struct LgtEmulator {
     core: ArmCore,
     system: System,
+}
+
+impl Drop for LgtEmulator {
+    fn drop(&mut self) {
+        self.core.stop_debugger();
+        self.system.shutdown();
+        self.core.shutdown();
+    }
 }
 
 impl LgtEmulator {
@@ -96,11 +104,11 @@ impl LgtEmulator {
     }
 
     pub fn loadable_jar(jar: &[u8]) -> bool {
-        let Ok(files) = extract_zip(jar) else {
+        let Ok(archive) = Archive::new(jar) else {
             return false;
         };
 
-        files.contains_key("binary.mod")
+        archive.names().any(|name| name == "binary.mod")
     }
 
     fn load(
@@ -174,7 +182,7 @@ impl Emulator for LgtEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick().map_err(|x| {
             let reg_stack = self.core.dump_reg_stack(0x1000); // TODO: hardcode
             match x {

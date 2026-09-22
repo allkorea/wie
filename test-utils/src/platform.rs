@@ -46,6 +46,7 @@ pub struct TestPlatform {
     db: Arc<MemoryDatabaseRepository>,
     font: Font,
     clock: Option<TestClock>,
+    budget_millis: AtomicU64,
 }
 
 impl Default for TestPlatform {
@@ -63,6 +64,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: None,
+            budget_millis: AtomicU64::new(0),
         }
     }
 
@@ -77,6 +79,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: None,
+            budget_millis: AtomicU64::new(0),
         }
     }
 
@@ -88,6 +91,7 @@ impl TestPlatform {
             db: Arc::new(MemoryDatabaseRepository::default()),
             font: Font::try_from_static(include_bytes!("../../assets/neodgm.ttf")).unwrap(),
             clock: Some(clock),
+            budget_millis: AtomicU64::new(0),
         }
     }
 }
@@ -112,6 +116,10 @@ impl Platform for TestPlatform {
 
     fn database_repository(&self) -> &dyn DatabaseRepository {
         self.db.as_ref()
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        self.budget_millis.fetch_add(1, Ordering::Relaxed)
     }
 
     fn filesystem(&self) -> &dyn Filesystem {
@@ -149,31 +157,32 @@ struct MemoryDatabaseRepository {
 
 #[async_trait::async_trait]
 impl DatabaseRepository for MemoryDatabaseRepository {
-    async fn open(&self, name: &str, app_id: &str) -> Box<dyn Database> {
+    async fn open(&self, name: &str, app_id: &str) -> Result<Box<dyn Database>> {
         let key = (app_id.to_string(), name.to_string());
         self.store.lock().entry(key.clone()).or_default();
-        Box::new(MemoryDatabase {
+        Ok(Box::new(MemoryDatabase {
             store: self.store.clone(),
             key,
-        })
+        }))
     }
 
-    async fn exists(&self, name: &str, app_id: &str) -> bool {
-        self.store.lock().contains_key(&(app_id.to_string(), name.to_string()))
+    async fn exists(&self, name: &str, app_id: &str) -> Result<bool> {
+        Ok(self.store.lock().contains_key(&(app_id.to_string(), name.to_string())))
     }
 
-    async fn delete(&self, name: &str, app_id: &str) -> bool {
-        self.store.lock().remove(&(app_id.to_string(), name.to_string())).is_some()
+    async fn delete(&self, name: &str, app_id: &str) -> Result<bool> {
+        Ok(self.store.lock().remove(&(app_id.to_string(), name.to_string())).is_some())
     }
 
-    async fn usage(&self, app_id: &str) -> u64 {
-        self.store
+    async fn usage(&self, app_id: &str) -> Result<u64> {
+        Ok(self
+            .store
             .lock()
             .iter()
-            .filter(|((record_app_id, _), _)| record_app_id == app_id)
+            .filter(|((id, _), _)| id == app_id)
             .flat_map(|(_, records)| records.values())
             .map(|record| record.len() as u64)
-            .sum()
+            .sum())
     }
 }
 
@@ -182,44 +191,50 @@ struct MemoryDatabase {
     key: DatabaseKey,
 }
 
+fn available_record_id(records: Option<&HashMap<RecordId, Vec<u8>>>) -> Result<RecordId> {
+    let mut id: RecordId = 1;
+    while records.is_some_and(|records| records.contains_key(&id)) {
+        id = id
+            .checked_add(1)
+            .ok_or_else(|| wie_util::WieError::FatalError("record IDs exhausted".into()))?;
+    }
+    Ok(id)
+}
+
 #[async_trait::async_trait]
 impl Database for MemoryDatabase {
-    async fn next_id(&self) -> RecordId {
-        let store = self.store.lock();
-        let records = store.get(&self.key);
-        let mut id = 1;
-        while records.is_some_and(|records| records.contains_key(&id)) {
-            id += 1;
-        }
-        id
+    async fn next_id(&self) -> Result<RecordId> {
+        available_record_id(self.store.lock().get(&self.key))
     }
 
-    async fn add(&mut self, data: &[u8]) -> RecordId {
-        let id = self.next_id().await;
-        self.set(id, data).await;
-        id
-    }
-
-    async fn get(&self, id: RecordId) -> Option<Vec<u8>> {
-        self.store.lock().get(&self.key)?.get(&id).cloned()
-    }
-
-    async fn set(&mut self, id: RecordId, data: &[u8]) -> bool {
+    async fn add(&mut self, data: &[u8]) -> Result<RecordId> {
         let mut store = self.store.lock();
-        store.entry(self.key.clone()).or_default().insert(id, data.to_vec());
-        true
+        let records = store.entry(self.key.clone()).or_default();
+        let id = available_record_id(Some(records))?;
+        records.insert(id, data.to_vec());
+        Ok(id)
     }
 
-    async fn delete(&mut self, id: RecordId) -> bool {
-        self.store.lock().get_mut(&self.key).is_some_and(|records| records.remove(&id).is_some())
+    async fn get(&self, id: RecordId) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.lock().get(&self.key).and_then(|records| records.get(&id)).cloned())
     }
 
-    async fn get_record_ids(&self) -> Vec<RecordId> {
-        self.store
+    async fn set(&mut self, id: RecordId, data: &[u8]) -> Result<bool> {
+        self.store.lock().entry(self.key.clone()).or_default().insert(id, data.to_vec());
+        Ok(true)
+    }
+
+    async fn delete(&mut self, id: RecordId) -> Result<bool> {
+        Ok(self.store.lock().get_mut(&self.key).is_some_and(|records| records.remove(&id).is_some()))
+    }
+
+    async fn get_record_ids(&self) -> Result<Vec<RecordId>> {
+        Ok(self
+            .store
             .lock()
             .get(&self.key)
             .map(|records| records.keys().copied().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 }
 

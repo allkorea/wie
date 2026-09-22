@@ -100,7 +100,7 @@ pub async fn set_timer(
     #[async_trait::async_trait]
     impl MethodBody<WieError> for TimerCallback {
         #[tracing::instrument(name = "timer", skip_all)]
-        async fn call(&self, context: &mut dyn WIPICContext, _: Box<[WIPICWord]>) -> Result<WIPICResult> {
+        async fn call(&self, context: &mut dyn WIPICContext, _: &[WIPICWord]) -> Result<WIPICResult> {
             context.call_function(self.fn_callback, &[self.ptr_timer, self.param]).await?;
 
             Ok(WIPICResult { results: Vec::new() })
@@ -112,6 +112,7 @@ pub async fn set_timer(
     let timer: WIPICTimer = read_generic(context, ptr_timer)?;
 
     context.set_timer(
+        ptr_timer,
         now + timeout,
         Box::new(TimerCallback {
             ptr_timer,
@@ -123,8 +124,9 @@ pub async fn set_timer(
     Ok(())
 }
 
-pub async fn unset_timer(_: &mut dyn WIPICContext, a0: WIPICWord) -> Result<()> {
-    tracing::warn!("stub MC_knlUnsetTimer({a0:#x})");
+pub async fn unset_timer(context: &mut dyn WIPICContext, timer: WIPICWord) -> Result<()> {
+    let cancelled = context.system().event_queue().cancel_timer(timer);
+    drop(cancelled);
 
     Ok(())
 }
@@ -296,7 +298,7 @@ pub async fn get_program_name(context: &mut dyn WIPICContext, name_buf: WIPICWor
 
 #[cfg(test)]
 mod test {
-    use alloc::{boxed::Box, string::String};
+    use alloc::string::String;
 
     use wie_util::{ByteRead, ByteWrite, Result, read_null_terminated_string_bytes, write_null_terminated_string_bytes};
 
@@ -314,18 +316,12 @@ mod test {
         let dest = context.alloc_raw(10).unwrap();
 
         write_null_terminated_string_bytes(&mut context, format, "%d".as_bytes()).unwrap();
-        sprintk
-            .call(&mut context, Box::new([dest, format, 1234, 0, 0, 0, 0, 0, 0, 0]))
-            .await
-            .unwrap();
+        sprintk.call(&mut context, &[dest, format, 1234, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
         let result = read_null_terminated_string_bytes(&context, dest).unwrap();
         assert_eq!(String::from_utf8(result).unwrap(), "1234");
 
         write_null_terminated_string_bytes(&mut context, format, "test %02d".as_bytes()).unwrap();
-        sprintk
-            .call(&mut context, Box::new([dest, format, 1, 0, 0, 0, 0, 0, 0, 0]))
-            .await
-            .unwrap();
+        sprintk.call(&mut context, &[dest, format, 1, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
         let result = read_null_terminated_string_bytes(&context, dest).unwrap();
         assert_eq!(String::from_utf8(result).unwrap(), "test 01");
 

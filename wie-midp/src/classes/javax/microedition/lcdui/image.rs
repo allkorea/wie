@@ -269,6 +269,19 @@ where
             _phantom: PhantomData,
         })
     }
+
+    fn for_colors(&self, start: usize, count: usize, mut visit: impl FnMut(usize, Color)) {
+        let mut pixels = [T::DataType::zeroed(); 256];
+        for offset in (0..count).step_by(pixels.len()) {
+            let len = (count - offset).min(pixels.len());
+            self.raw_buffer
+                .read((start + offset) * size_of::<T::DataType>(), bytemuck::cast_slice_mut(&mut pixels[..len]))
+                .unwrap();
+            for (index, &raw) in pixels[..len].iter().enumerate() {
+                visit(offset + index, T::to_color(raw));
+            }
+        }
+    }
 }
 
 impl<T> BackendImage for JavaImageBuffer<T>
@@ -305,11 +318,22 @@ where
     }
 
     fn colors(&self) -> Vec<Color> {
-        let buffer = self.raw();
+        let count = (self.width() * self.height()) as usize;
+        let mut colors = Vec::with_capacity(count);
+        self.for_colors(0, count, |_, color| colors.push(color));
+        colors
+    }
 
-        let data: Vec<T::DataType> = bytemuck::pod_collect_to_vec(&buffer);
+    fn read_colors(&self, x: u32, y: u32, colors: &mut [Color]) {
+        let start = y as usize * self.width as usize + x as usize;
+        self.for_colors(start, colors.len(), |index, color| colors[index] = color);
+    }
 
-        data.into_iter().map(T::to_color).collect()
+    fn copy_rgba(&self, rgba: &mut Vec<u8>) {
+        rgba.clear();
+        self.for_colors(0, (self.width() * self.height()) as usize, |_, color| {
+            rgba.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+        });
     }
 }
 
@@ -318,7 +342,7 @@ where
     T: PixelType,
 {
     fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
-        if x > self.width || y > self.height || x < 0 || y < 0 {
+        if x >= self.width || y >= self.height || x < 0 || y < 0 {
             return;
         }
 
@@ -330,19 +354,36 @@ where
         self.raw_buffer.write(offset as _, raw_bytes).unwrap();
     }
 
-    fn put_pixels(&mut self, x: i32, y: i32, _width: u32, colors: &[Color]) {
-        if x > self.width || y > self.height || x < 0 || y < 0 {
+    fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]) {
+        if width == 0 || self.width <= 0 || self.height <= 0 {
             return;
         }
 
-        let offset = (((y as u32) * self.width() + (x as u32)) * self.bytes_per_pixel()) as usize;
+        let mut pixels = [T::DataType::zeroed(); 256];
+        for (row_index, row) in colors.chunks(width as usize).enumerate() {
+            let py = y as i64 + row_index as i64;
+            if py >= self.height as i64 {
+                break;
+            }
+            if py < 0 {
+                continue;
+            }
+            let start = (-(x as i64)).clamp(0, row.len() as i64) as usize;
+            let end = (self.width as i64 - x as i64).clamp(0, row.len() as i64) as usize;
+            if start >= end {
+                continue;
+            }
 
-        let raw_bytes = colors
-            .iter()
-            .flat_map(|color| bytemuck::bytes_of(&T::from_color(*color)).to_vec())
-            .collect::<Vec<_>>();
-
-        self.raw_buffer.write(offset as _, &raw_bytes).unwrap();
+            let mut offset = (py as usize * self.width as usize + (x as i64 + start as i64) as usize) * size_of::<T::DataType>();
+            for chunk in row[start..end].chunks(pixels.len()) {
+                for (pixel, &color) in pixels.iter_mut().zip(chunk) {
+                    *pixel = T::from_color(color);
+                }
+                let bytes = bytemuck::cast_slice(&pixels[..chunk.len()]);
+                self.raw_buffer.write(offset, bytes).unwrap();
+                offset += bytes.len();
+            }
+        }
     }
 
     fn xor_pixel(&mut self, x: i32, y: i32, color: Color) {
@@ -364,7 +405,7 @@ where
 mod tests {
     use super::*;
 
-    async fn check_pixel_buffer<T: PixelType>(jvm: &Jvm, pixels: [T::DataType; 2]) -> JvmResult<()> {
+    async fn check_pixel_buffer<T: PixelType + 'static>(jvm: &Jvm, pixels: [T::DataType; 2]) -> JvmResult<()> {
         let size = size_of::<T::DataType>();
         let image = Image::create_image_instance(jvm, 2, 1, bytemuck::cast_slice(&pixels), size as u32).await?;
         let mut buffer = JavaImageBuffer::<T>::new(jvm, &image).await?;
@@ -381,6 +422,49 @@ mod tests {
         buffer.xor_pixel(1, 0, color);
         let expected = [pixels[0], T::xor_color(pixels[1], color)];
         assert_eq!(&*buffer.raw(), bytemuck::cast_slice(&expected));
+        buffer.put_pixel(2, 0, color);
+        buffer.put_pixel(0, 1, color);
+        buffer.put_pixels(0, 0, 0, &[color]);
+        assert_eq!(&*buffer.raw(), bytemuck::cast_slice(&expected));
+
+        let image = Image::create_image_instance(jvm, 3, 2, &vec![0; 6 * size], size as u32).await?;
+        let mut buffer = JavaImageBuffer::<T>::new(jvm, &image).await?;
+        let mut reference = wie_backend::canvas::VecImageBuffer::<T>::new(3, 2);
+        let colors: Vec<_> = (0..7)
+            .map(|i| Color {
+                a: 255,
+                r: i * 30,
+                g: 255 - i * 30,
+                b: i * 20,
+            })
+            .collect();
+        for (x, y, width) in [(1, 0, 2), (-1, -1, 3), (-1, 0, 3), (2, 1, 3), (i32::MAX, 0, 3)] {
+            buffer.put_pixels(x, y, width, &colors);
+            // Extreme coordinates are entirely outside; the reference uses i32 addition.
+            if x != i32::MAX {
+                reference.put_pixels(x, y, width, &colors);
+            }
+            assert_eq!(&*buffer.raw(), &*reference.raw());
+            let actual: Vec<_> = buffer.colors().into_iter().map(|c| (c.a, c.r, c.g, c.b)).collect();
+            let expected: Vec<_> = reference.colors().into_iter().map(|c| (c.a, c.r, c.g, c.b)).collect();
+            assert_eq!(actual, expected);
+            let mut rgba = Vec::with_capacity(24);
+            let storage = rgba.as_ptr();
+            buffer.copy_rgba(&mut rgba);
+            let expected: Vec<_> = reference.colors().into_iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
+            assert_eq!(rgba, expected);
+            assert_eq!(rgba.as_ptr(), storage);
+        }
+        let pixels = vec![T::from_color(color); 260];
+        let image = Image::create_image_instance(jvm, 260, 1, bytemuck::cast_slice(&pixels), size as u32).await?;
+        let buffer = JavaImageBuffer::<T>::new(jvm, &image).await?;
+        let mut row = [color; 258];
+        buffer.read_colors(1, 0, &mut row);
+        let expected = T::to_color(pixels[0]);
+        assert!(
+            row.iter()
+                .all(|c| (c.a, c.r, c.g, c.b) == (expected.a, expected.r, expected.g, expected.b))
+        );
         Ok(())
     }
 

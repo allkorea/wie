@@ -75,7 +75,7 @@ impl WIPICContext for KtfWIPICContext {
         impl AsyncCallable<Result<()>> for SpawnProxy {
             async fn call(mut self) -> Result<()> {
                 self.context.jvm.attach_thread(None).await.unwrap();
-                self.callback.call(&mut self.context, Box::new([])).await?;
+                self.callback.call(&mut self.context, &[]).await?;
                 self.context.jvm.detach_thread().unwrap();
 
                 Ok(())
@@ -149,14 +149,14 @@ impl WIPICContext for KtfWIPICContext {
         Ok(data)
     }
 
-    fn set_timer(&mut self, due: Instant, callback: WIPICMethodBody) {
+    fn set_timer(&mut self, timer: WIPICWord, due: Instant, callback: WIPICMethodBody) {
         let context = self.clone();
 
-        self.system().event_queue().push(Event::timer(due, move || {
+        self.system().event_queue().push(Event::timer(due, Some(timer), move || {
             let mut context = context.clone();
 
             async move {
-                callback.call(&mut context, Box::new([])).await?;
+                callback.call(&mut context, &[]).await?;
                 Ok(())
             }
         }))

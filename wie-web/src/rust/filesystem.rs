@@ -1,8 +1,8 @@
-use alloc::{boxed::Box, rc::Rc, string::ToString, vec};
+use alloc::{boxed::Box, rc::Rc, string::ToString};
 use core::cell::RefCell;
-use core::cmp::{max, min};
 
 use wie_backend::Filesystem;
+use wie_util::{Result, WieError};
 
 use crate::indexed_db_store::{Store, StoreKey};
 
@@ -17,7 +17,7 @@ pub struct WebFilesystem {
     store: Rc<RefCell<Option<Store>>>,
 }
 
-// single threaded wasm; RefCell + Rc are only touched sequentially.
+// Single-threaded wasm; these JS handles stay in their originating realm.
 unsafe impl Send for WebFilesystem {}
 unsafe impl Sync for WebFilesystem {}
 
@@ -28,61 +28,43 @@ impl WebFilesystem {
         }
     }
 
-    async fn store(&self) -> Store {
+    async fn store(&self) -> Result<Store> {
         if let Some(store) = self.store.borrow().as_ref() {
-            return store.clone();
+            return Ok(store.clone());
         }
-        let store = Store::open(DB_NAME, STORE_NAME).await;
+        let store = Store::open(DB_NAME, STORE_NAME).await?;
         *self.store.borrow_mut() = Some(store.clone());
-        store
+        Ok(store)
     }
 }
 
 #[async_trait::async_trait]
 impl Filesystem for WebFilesystem {
-    async fn exists(&self, aid: &str, path: &str) -> bool {
-        self.store().await.get(make_key(aid, path)).await.is_some()
+    async fn exists(&self, aid: &str, path: &str) -> Result<bool> {
+        self.store().await?.contains(make_key(aid, path)).await
     }
 
-    async fn size(&self, aid: &str, path: &str) -> Option<usize> {
-        self.store().await.get(make_key(aid, path)).await.map(|v| v.len())
+    async fn size(&self, aid: &str, path: &str) -> Result<Option<usize>> {
+        self.store().await?.size(make_key(aid, path)).await
     }
 
-    async fn read(&self, aid: &str, path: &str, offset: usize, count: usize, buf: &mut [u8]) -> Option<usize> {
-        let data = self.store().await.get(make_key(aid, path)).await?;
-
-        if offset >= data.len() {
-            return Some(0);
+    async fn read(&self, aid: &str, path: &str, offset: usize, count: usize, buf: &mut [u8]) -> Result<Option<usize>> {
+        let count = count.min(buf.len());
+        let Some(data) = self.store().await?.read(make_key(aid, path), offset, count).await? else {
+            return Ok(None);
+        };
+        if data.len() > count {
+            return Err(WieError::FatalError("storage read exceeded output length".into()));
         }
-
-        let size_to_read = min(count, data.len() - offset);
-        buf[..size_to_read].copy_from_slice(&data[offset..offset + size_to_read]);
-        Some(size_to_read)
+        buf[..data.len()].copy_from_slice(&data);
+        Ok(Some(data.len()))
     }
 
-    async fn write(&self, aid: &str, path: &str, offset: usize, data: &[u8]) -> usize {
-        let key = make_key(aid, path);
-        let store = self.store().await;
-        let existing = store.get(key.clone()).await.unwrap_or_default();
-        let new_len = max(existing.len(), offset + data.len());
-
-        let mut next = vec![0u8; new_len];
-        next[..existing.len()].copy_from_slice(&existing);
-        next[offset..offset + data.len()].copy_from_slice(data);
-
-        store.set(key, &next).await;
-        data.len()
+    async fn write(&self, aid: &str, path: &str, offset: usize, data: &[u8], initial: &[u8]) -> Result<usize> {
+        self.store().await?.write(make_key(aid, path), offset, data, initial).await
     }
 
-    async fn truncate(&self, aid: &str, path: &str, len: usize) {
-        let key = make_key(aid, path);
-        let store = self.store().await;
-        let existing = store.get(key.clone()).await.unwrap_or_default();
-
-        let mut next = vec![0u8; len];
-        let copy_len = min(existing.len(), len);
-        next[..copy_len].copy_from_slice(&existing[..copy_len]);
-
-        store.set(key, &next).await;
+    async fn truncate(&self, aid: &str, path: &str, len: usize, initial: &[u8]) -> Result<()> {
+        self.store().await?.truncate(make_key(aid, path), len, initial).await
     }
 }

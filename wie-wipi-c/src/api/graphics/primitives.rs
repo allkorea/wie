@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
+mod copy;
+
 use alloc::{string::String, vec};
 
 use wie_backend::canvas::{Clip, Color, Image, PixelType, Rgb8Pixel};
@@ -26,7 +28,7 @@ where
     F: FnOnce(&mut dyn wie_backend::canvas::Canvas),
 {
     let mut canvas = framebuffer.canvas(context)?;
-    operation(&mut **canvas);
+    operation(&mut *canvas);
     canvas.flush()
 }
 
@@ -135,10 +137,7 @@ pub fn copy_area(
     source_y: i32,
     clip: Clip,
 ) -> Result<()> {
-    let image = framebuffer.image(context)?;
-    write_canvas(context, framebuffer, |canvas| {
-        canvas.draw(x, y, width, height, &*image, source_x, source_y, clip)
-    })
+    copy::framebuffer(context, framebuffer, x, y, width, height, framebuffer, source_x, source_y, clip)
 }
 
 pub fn copy_framebuffer(
@@ -153,10 +152,7 @@ pub fn copy_framebuffer(
     source_y: i32,
     clip: Clip,
 ) -> Result<()> {
-    let image = source.image(context)?;
-    write_canvas(context, destination, |canvas| {
-        canvas.draw(x, y, width, height, &*image, source_x, source_y, clip)
-    })
+    copy::framebuffer(context, destination, x, y, width, height, source, source_x, source_y, clip)
 }
 
 pub fn draw_text(context: &mut dyn WIPICContext, framebuffer: &FrameBuffer, string: &str, x: i32, y: i32, color: Color, clip: Clip) -> Result<()> {
@@ -266,7 +262,8 @@ pub fn set_rgb_pixels(
 
 #[cfg(test)]
 mod tests {
-    use wie_backend::canvas::{Clip, Color};
+    use alloc::vec::Vec;
+    use wie_backend::canvas::{ArgbPixel, Canvas, Clip, Color, ImageBufferCanvas, PixelType, Rgb565Pixel, VecImageBuffer};
     use wie_util::{ByteRead, ByteWrite, Result};
 
     use crate::{
@@ -301,6 +298,41 @@ mod tests {
         assert_eq!(image.get_pixel(0, 0).r, 255);
         assert_eq!(image.get_pixel(1, 1).r, 255);
         assert_eq!(image.get_pixel(3, 3).r, 0);
+        check_framebuffer_copy::<Rgb565Pixel>()?;
+        check_framebuffer_copy::<ArgbPixel>()?;
+        Ok(())
+    }
+
+    fn check_framebuffer_copy<T: PixelType + 'static>() -> Result<()> {
+        let raw: Vec<_> = (0..18)
+            .map(|i| {
+                T::from_color(Color {
+                    a: i * 14,
+                    r: i * 13,
+                    g: 255 - i * 11,
+                    b: i * 9,
+                })
+            })
+            .collect();
+        let source_image = VecImageBuffer::<T>::from_raw(6, 3, raw.clone());
+        let mut context = TestContext::new();
+        let source = FrameBuffer::from_image(&mut context, &source_image)?;
+        let mut expected = ImageBufferCanvas::new(VecImageBuffer::<T>::from_raw(6, 3, raw));
+        let clip = Clip {
+            x: 1,
+            y: 0,
+            width: 4,
+            height: 3,
+        };
+        expected.draw(1, 1, 5, 2, &source_image, 0, 0, clip);
+        super::copy_area(&mut context, &source, 1, 1, 5, 2, 0, 0, clip)?;
+        assert_eq!(&*source.image(&mut context)?.raw(), &*expected.image().raw());
+
+        let destination = FrameBuffer::from_image(&mut context, expected.image())?;
+        let snapshot = source.image(&mut context)?;
+        expected.draw(-1, 0, 6, 3, &*snapshot, 0, 0, clip);
+        super::copy_framebuffer(&mut context, &destination, -1, 0, 6, 3, &source, 0, 0, clip)?;
+        assert_eq!(&*destination.image(&mut context)?.raw(), &*expected.image().raw());
         Ok(())
     }
 

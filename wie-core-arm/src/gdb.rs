@@ -6,7 +6,7 @@ mod tcp;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use dummy::start;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use tcp::start;
+pub(crate) use tcp::{GdbServer, start};
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{marker::PhantomData, time::Duration};
@@ -65,6 +65,7 @@ fn to_gdb_stop_reason(reason: DebugStopReason) -> MultiThreadStopReason<u32> {
             signal: Signal::SIGTRAP,
             tid: Tid::try_from(thread_id).unwrap(),
         },
+        DebugStopReason::Exited => MultiThreadStopReason::Exited(0),
     }
 }
 
@@ -334,6 +335,9 @@ impl<C: ConnectionExt> BlockingEventLoop for GdbBlockingEventLoop<C> {
         conn: &mut Self::Connection,
     ) -> Result<Event<MultiThreadStopReason<u32>>, WaitForStopReasonError<GdbTargetError, C::Error>> {
         loop {
+            if target.debug.is_stopped() {
+                return Ok(Event::TargetStopped(MultiThreadStopReason::Exited(0)));
+            }
             match target.debug.recv_stop_event_timeout(Duration::from_millis(10)) {
                 Ok(reason) => return Ok(Event::TargetStopped(to_gdb_stop_reason(reason))),
                 Err(channel::RecvTimeoutError::Timeout) => match conn.peek() {

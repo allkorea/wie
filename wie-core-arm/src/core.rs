@@ -67,6 +67,8 @@ fn drain_samples(samples: &mut BTreeMap<Vec<u32>, u64>) -> Vec<ProfileSample> {
 pub struct ArmCore {
     pub(crate) inner: Arc<Mutex<ArmCoreInner>>, // TODO can we change it to another lock like async-lock?
     threads: Arc<Mutex<BTreeMap<ThreadId, ThreadState>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    gdb_server: Option<Arc<crate::gdb::GdbServer>>,
 }
 
 impl ArmCore {
@@ -77,8 +79,8 @@ impl ArmCore {
             Box::new(Arm32CpuEngine::new())
         };
 
-        engine.mem_map(FUNCTIONS_BASE, FUNCTIONS_SIZE, MemoryPermission::ReadExecute);
-        engine.mem_map(GLOBAL_DATA_BASE, 0x4000, MemoryPermission::ReadWriteExecute);
+        engine.mem_map(FUNCTIONS_BASE, FUNCTIONS_SIZE, MemoryPermission::ReadExecute)?;
+        engine.mem_map(GLOBAL_DATA_BASE, 0x4000, MemoryPermission::ReadWriteExecute)?;
 
         let profile = profile.map(|callback| ProfileState {
             samples: BTreeMap::new(),
@@ -98,13 +100,52 @@ impl ArmCore {
         let result = Self {
             inner: Arc::new(Mutex::new(inner)),
             threads: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            gdb_server: None,
         };
 
         if enable_gdbserver {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // The server's target must not retain its own join handle.
+                let server = crate::gdb::start(result.clone())?;
+                return Ok(Self {
+                    gdb_server: Some(Arc::new(server)),
+                    ..result
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
             crate::gdb::start(result.clone())?;
         }
 
         Ok(result)
+    }
+
+    /// Stop and join the debugger before the runtime owner cancels guest tasks.
+    pub fn stop_debugger(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(server) = &self.gdb_server {
+            server.shutdown();
+        }
+    }
+
+    /// Terminal owner cleanup after all runtime tasks have stopped; do not resume this core afterwards.
+    pub fn shutdown(&mut self) {
+        self.stop_debugger();
+        let (handlers, profile) = {
+            let mut inner = self.inner.lock();
+            (core::mem::take(&mut inner.svc_handlers), inner.profile.take())
+        };
+        let threads = core::mem::take(&mut *self.threads.lock());
+        // Thread stacks and callback contexts can retain ArmCore and reenter its locks on drop.
+        drop(threads);
+        drop(handlers);
+        if let Some(mut profile) = profile {
+            let batch = drain_samples(&mut profile.samples);
+            if !batch.is_empty() {
+                (profile.callback)(batch);
+            }
+        }
     }
 
     pub(crate) fn debug_inner(&self) -> Option<Arc<DebugInner>> {
@@ -118,11 +159,13 @@ impl ArmCore {
     }
 
     pub fn load(&mut self, data: &[u8], address: u32, map_size: usize) -> Result<()> {
+        let map_size = map_size
+            .checked_add(0xfff)
+            .map(|size| size & !0xfff)
+            .ok_or(WieError::InvalidMemoryAccess(address))?;
         let mut inner = self.inner.lock();
 
-        inner
-            .engine
-            .mem_map(address, map_size.next_multiple_of(0x1000), MemoryPermission::ReadWriteExecute);
+        inner.engine.mem_map(address, map_size, MemoryPermission::ReadWriteExecute)?;
         inner.engine.mem_write(address, data)?;
 
         Ok(())
@@ -383,9 +426,7 @@ impl ArmCore {
 
         let mut inner = self.inner.lock();
 
-        inner.engine.mem_map(address, size as usize, MemoryPermission::ReadWrite);
-
-        Ok(())
+        inner.engine.mem_map(address, size as usize, MemoryPermission::ReadWrite)
     }
 
     pub fn dump_reg_stack(&self, image_base: u32) -> String {
@@ -1013,5 +1054,28 @@ mod tests {
             EngineStopReason::End => panic!("expected SVC, got end"),
             EngineStopReason::Yield => panic!("expected SVC, got yield"),
         }
+    }
+
+    #[test]
+    fn shutdown_breaks_callback_and_thread_ownership_cycles() {
+        async fn handler(_: &mut ArmCore, _: &mut ArmCore) -> Result<()> {
+            Ok(())
+        }
+
+        let mut core = ArmCore::new(false, None).unwrap();
+        crate::Allocator::init(&mut core).unwrap();
+        let weak_core = Arc::downgrade(&core.inner);
+        let weak_threads = Arc::downgrade(&core.threads);
+        let context = core.clone();
+        core.register_svc_handler(1, handler, &context).unwrap();
+        drop(context);
+        let thread = core.run_in_thread(|| async { Ok(()) }).unwrap();
+        core.shutdown();
+        core.shutdown();
+        assert!(core.get_thread_ids().is_empty());
+        drop(thread);
+        drop(core);
+        assert!(weak_core.upgrade().is_none());
+        assert!(weak_threads.upgrade().is_none());
     }
 }

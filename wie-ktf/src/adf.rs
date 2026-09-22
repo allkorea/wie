@@ -1,5 +1,4 @@
 use alloc::{
-    collections::BTreeMap,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -7,7 +6,7 @@ use alloc::{
 
 use encoding_rs::EUC_KR;
 
-use wie_backend::extract_zip;
+use wie_backend::Archive;
 use wie_util::{Result, WieError};
 
 pub struct KtfAdf {
@@ -62,7 +61,7 @@ fn parse_display_size(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 pub fn find_client_bin(jar: &[u8]) -> Result<(String, Vec<u8>)> {
-    let files: BTreeMap<String, Vec<u8>> = extract_zip(jar)?;
+    let files = Archive::new(jar)?.extract_matching(|name| name.starts_with("client.bin"))?;
 
     files
         .into_iter()

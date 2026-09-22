@@ -15,8 +15,8 @@ macro_rules! __impl_fn_helper {
         {
             type Output = Fut;
             #[allow(unused_assignments, non_snake_case, unused_mut, unused_variables)]
-            fn do_call(&self, context: &'a mut dyn $context, args: Box<[$raw_type]>) -> Fut {
-                let mut args = alloc::vec::Vec::from(args).into_iter();
+            fn do_call(&self, context: &'a mut dyn $context, args: &[$raw_type]) -> Fut {
+                let mut args = args.iter().copied();
                 $(
                     let $arg = $arg::convert(context, args.next().unwrap());
                 )*
@@ -35,7 +35,7 @@ macro_rules! __impl_method_body {
             R: ResultConverter<R> + Sync + Send,
             $($arg: Sync + Send),*
         {
-            async fn call(&self, context: &mut dyn $context, args: Box<[$raw_type]>) -> Result<WIPICResult, E> {
+            async fn call(&self, context: &mut dyn $context, args: &[$raw_type]) -> Result<WIPICResult, E> {
                 let result = self.0.do_call(context, args).await?;
 
                 Ok(R::convert(context, result))
@@ -71,12 +71,12 @@ macro_rules! methods {
     ($context: ident, $raw_type: ty) => {
         #[async_trait::async_trait]
         pub trait MethodBody<E>: Sync + Send {
-            async fn call(&self, context: &mut dyn $context, args: Box<[$raw_type]>) -> Result<WIPICResult, E>;
+            async fn call(&self, context: &mut dyn $context, args: &[$raw_type]) -> Result<WIPICResult, E>;
         }
 
         trait FnHelper<'a, E, R, P> {
             type Output: Future<Output = Result<R, E>> + 'a + Send;
-            fn do_call(&self, context: &'a mut dyn $context, args: Box<[$raw_type]>) -> Self::Output;
+            fn do_call(&self, context: &'a mut dyn $context, args: &[$raw_type]) -> Self::Output;
         }
 
         struct MethodHolder<F, R, P>(pub F, PhantomData<(R, P)>);

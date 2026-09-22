@@ -2,7 +2,7 @@ mod audio;
 mod event_queue;
 mod file_system;
 
-use alloc::{borrow::ToOwned, boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 
 use spin::{RwLock, RwLockWriteGuard};
 
@@ -25,8 +25,8 @@ pub use self::{
 
 #[derive(Clone)]
 pub struct System {
-    pid: String,
-    aid: String,
+    pid: Arc<str>,
+    aid: Arc<str>,
     executor: Executor,
     platform: Arc<Box<dyn Platform>>,
     filesystem: FilesystemOverlay,
@@ -45,8 +45,8 @@ impl System {
         let platform = Arc::new(platform);
 
         Self {
-            pid: pid.to_owned(),
-            aid: aid.to_owned(), // TODO create metadata dictionary or something
+            pid: Arc::from(pid),
+            aid: Arc::from(aid),
             executor: Executor::new(),
             filesystem: FilesystemOverlay::new(platform.clone(), aid),
             platform,
@@ -57,9 +57,19 @@ impl System {
         }
     }
 
-    pub fn tick(&mut self) -> Result<()> {
+    /// Terminal cleanup by the emulator owner; dropping a shared System handle does not stop it.
+    pub fn shutdown(&mut self) {
+        self.executor.shutdown();
+        let events = core::mem::take(&mut *self.event_queue.write());
+        // Timer callbacks can retain System handles; release them without the queue lock.
+        drop(events);
+        self.audio.write().shutdown();
+    }
+
+    /// Returns true when the host budget expired with runnable work remaining.
+    pub fn tick(&mut self) -> Result<bool> {
         let platform = self.platform.clone();
-        self.executor.tick(move || platform.now())
+        self.executor.tick(|| platform.now(), || platform.monotonic_millis())
     }
 
     pub fn spawn<C>(&self, callable: C)
