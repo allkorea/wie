@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, task::Wake};
+use alloc::{boxed::Box, sync::Arc, task::Wake, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
@@ -29,8 +29,9 @@ impl Wake for TaskWake {
 
 pub struct ExecutorInner {
     current_task_id: Option<usize>,
-    tasks: HashMap<usize, Task>,
+    tasks: HashMap<usize, Option<Task>>,
     sleeping_tasks: HashMap<usize, Instant>,
+    task_ids: Vec<usize>,
     last_task_id: usize,
     last_now: Instant,
     stopped: bool,
@@ -86,6 +87,7 @@ impl Executor {
             current_task_id: None,
             tasks: HashMap::new(),
             sleeping_tasks: HashMap::new(),
+            task_ids: Vec::new(),
             last_task_id: 0,
             last_now: Instant::from_epoch_millis(0),
             stopped: false,
@@ -119,7 +121,7 @@ impl Executor {
             }
             inner.last_task_id += 1;
             let task_id = inner.last_task_id;
-            inner.tasks.insert(task_id, Box::pin(fut));
+            inner.tasks.insert(task_id, Some(Box::pin(fut)));
             task_id
         };
 
@@ -181,54 +183,56 @@ impl Executor {
     }
 
     fn step(&mut self, now: Instant) -> Result<()> {
-        self.inner.lock().last_now = now;
-
-        let mut next_tasks = HashMap::new();
-        let tasks = self.inner.lock().tasks.drain().collect::<HashMap<_, _>>();
-        let mut sleeping_tasks = self.inner.lock().sleeping_tasks.drain().collect::<HashMap<_, _>>();
+        let mut task_ids = {
+            let mut inner = self.inner.lock();
+            inner.last_now = now;
+            let mut task_ids = core::mem::take(&mut inner.task_ids);
+            task_ids.extend(inner.tasks.keys().copied());
+            task_ids
+        };
 
         let mut first_error = None;
         let waker = Waker::from(self.wake.clone());
 
-        for (task_id, mut task) in tasks.into_iter() {
-            if self.inner.lock().stopped {
-                break;
-            }
-            let item = sleeping_tasks.get(&task_id);
-            if let Some(item) = item {
-                if *item <= now {
-                    sleeping_tasks.remove(&task_id);
-                } else {
-                    next_tasks.insert(task_id, task);
+        for task_id in task_ids.iter().copied() {
+            let (mut task, previous_task_id) = {
+                let mut inner = self.inner.lock();
+                if inner.stopped {
+                    break;
+                }
+                if inner.sleeping_tasks.get(&task_id).is_some_and(|until| *until > now) {
                     continue;
                 }
-            }
+                inner.sleeping_tasks.remove(&task_id);
+                let Some(task) = inner.tasks.get_mut(&task_id).and_then(Option::take) else {
+                    continue;
+                };
+                (task, inner.current_task_id.replace(task_id))
+            };
 
             let mut context = Context::from_waker(&waker);
-            self.inner.lock().current_task_id = Some(task_id);
-
-            match task.as_mut().poll(&mut context) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+            let result = task.as_mut().poll(&mut context);
+            {
+                let mut inner = self.inner.lock();
+                inner.current_task_id = previous_task_id;
+                if !inner.stopped && result.is_pending() {
+                    // The occupied slot preserves the map allocation and iteration order.
+                    *inner.tasks.get_mut(&task_id).unwrap() = Some(task);
+                    continue;
                 }
-                Poll::Pending => {
-                    next_tasks.insert(task_id, task);
-                }
+                inner.tasks.remove(&task_id);
+                inner.sleeping_tasks.remove(&task_id);
             }
-
-            self.inner.lock().current_task_id = None;
-        }
-
-        {
-            let mut inner = self.inner.lock();
-            if !inner.stopped {
-                inner.sleeping_tasks.extend(sleeping_tasks);
-                inner.tasks.extend(next_tasks);
+            // Completed and cancelled futures can re-enter the executor on drop.
+            drop(task);
+            if let Poll::Ready(Err(err)) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
             }
         }
+        task_ids.clear();
+        self.inner.lock().task_ids = task_ids;
 
         if let Some(err) = first_error { Err(err) } else { Ok(()) }
     }
@@ -247,7 +251,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{boxed::Box, sync::Arc};
     use core::{
         cell::Cell,
         future::{Future, poll_fn},
@@ -306,6 +310,43 @@ mod tests {
             executor.tick(advancing_clock(100)).unwrap();
             assert_eq!(polls.load(Ordering::Relaxed), wakes + 2);
         }
+    }
+
+    #[test]
+    fn repeated_steps_reuse_task_storage_and_drop_completed_futures_outside_locks() {
+        struct OnDrop(Executor);
+        impl Future for OnDrop {
+            type Output = wie_util::Result<()>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let inner = self.0.inner.try_lock().unwrap();
+                assert!(inner.current_task_id.is_none());
+            }
+        }
+
+        let mut executor = Executor::new();
+        for _ in 0..32 {
+            executor.spawn(|| core::future::pending::<()>());
+        }
+        executor.inner.lock().tasks.insert(33, Some(Box::pin(OnDrop(executor.clone()))));
+        executor.step(Instant::from_epoch_millis(0)).unwrap();
+        let (capacity, ids) = {
+            let inner = executor.inner.lock();
+            (inner.tasks.capacity(), inner.task_ids.as_ptr())
+        };
+        for now in 1..100 {
+            executor.step(Instant::from_epoch_millis(now)).unwrap();
+            let inner = executor.inner.lock();
+            assert_eq!(inner.tasks.len(), 32);
+            assert_eq!(inner.tasks.capacity(), capacity);
+            assert_eq!(inner.task_ids.as_ptr(), ids);
+        }
+        executor.shutdown();
     }
 
     #[test]
