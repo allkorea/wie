@@ -27,7 +27,7 @@ use tracing_web::MakeConsoleWriter;
 use wasm_bindgen::{JsError, prelude::*};
 use web_sys::HtmlCanvasElement;
 
-use wie_backend::{Emulator, Event, Font, Instant, KeyCode, Options, Platform, Screen, extract_zip};
+use wie_backend::{Archive, Emulator, Event, Font, Instant, KeyCode, Options, Platform, Screen, extract_zip};
 use wie_j2me::J2MEEmulator;
 use wie_ktf::KtfEmulator;
 use wie_lgt::LgtEmulator;
@@ -61,17 +61,21 @@ fn parse_archive(buf: &[u8]) -> anyhow::Result<(ArchivePlatform, BTreeMap<String
         anyhow::bail!("Archive does not contain a JAR file");
     }
 
-    let platform = if KtfEmulator::loadable_archive(&files) {
+    Ok((archive_platform(&files)?, files))
+}
+
+fn archive_platform(files: &BTreeMap<String, Vec<u8>>) -> anyhow::Result<ArchivePlatform> {
+    let platform = if KtfEmulator::loadable_archive(files) {
         ArchivePlatform::Ktf
-    } else if LgtEmulator::loadable_archive(&files) {
+    } else if LgtEmulator::loadable_archive(files) {
         ArchivePlatform::Lgt
-    } else if SktEmulator::loadable_archive(&files) {
+    } else if SktEmulator::loadable_archive(files) {
         ArchivePlatform::Skt
     } else {
         anyhow::bail!("Unknown archive format");
     };
 
-    Ok((platform, files))
+    Ok(platform)
 }
 
 fn jar_app_id<'a>(filename: &'a str, buf: &[u8]) -> &'a str {
@@ -206,7 +210,23 @@ impl ImportedAppMetadata {
 pub fn extract_app_metadata(filename: &str, buf: &[u8]) -> Result<ImportedAppMetadata, JsError> {
     let lowercase_filename = filename.to_ascii_lowercase();
     let metadata = if lowercase_filename.ends_with(".zip") {
-        let (platform, files) = parse_archive(buf).map_err(|error| JsError::new(&error.to_string()))?;
+        let mut archive = Archive::new(buf).map_err(|error| JsError::new(&error.to_string()))?;
+        if !archive.names().any(|name| name.to_ascii_lowercase().ends_with(".jar")) {
+            return Err(JsError::new("Archive does not contain a JAR file"));
+        }
+        let mut files = archive
+            .extract_matching(|name| matches!(name, "__adf__" | "app_info") || name.ends_with(".msd"))
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let platform = archive_platform(&files).map_err(|error| JsError::new(&error.to_string()))?;
+        files.extend(
+            archive
+                .extract_matching(|name| match platform {
+                    ArchivePlatform::Ktf => name == "big.icon",
+                    ArchivePlatform::Lgt => name == "big.png",
+                    ArchivePlatform::Skt => name.ends_with(".wmr") || name.ends_with(".res"),
+                })
+                .map_err(|error| JsError::new(&error.to_string()))?,
+        );
         match platform {
             ArchivePlatform::Ktf => KtfEmulator::archive_id(&files)
                 .zip(KtfEmulator::archive_title(&files))

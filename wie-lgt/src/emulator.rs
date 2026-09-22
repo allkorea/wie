@@ -15,7 +15,7 @@ use jvm::{
     runtime::{JavaIoInputStream, JavaLangClassLoader},
 };
 
-use wie_backend::{Emulator, Event, Options, Platform, System, TaskRunner, extract_zip};
+use wie_backend::{Archive, Emulator, Event, Options, Platform, System, TaskRunner};
 use wie_core_arm::{Allocator, ArmCore};
 use wie_jvm_support::JvmSupport;
 use wie_util::{Result, WieError};
@@ -104,11 +104,11 @@ impl LgtEmulator {
     }
 
     pub fn loadable_jar(jar: &[u8]) -> bool {
-        let Ok(files) = extract_zip(jar) else {
+        let Ok(archive) = Archive::new(jar) else {
             return false;
         };
 
-        files.contains_key("binary.mod")
+        archive.names().any(|name| name == "binary.mod")
     }
 
     fn load(

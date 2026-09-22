@@ -12,7 +12,7 @@ use jvm::{
     runtime::{JavaIoInputStream, JavaLangString},
 };
 
-use wie_backend::{DefaultTaskRunner, Emulator, Event, Platform, System, extract_zip};
+use wie_backend::{Archive, DefaultTaskRunner, Emulator, Event, Platform, System};
 use wie_jvm_support::{JvmSupport, RustJavaJvmImplementation};
 use wie_util::{Result, WieError};
 
@@ -28,11 +28,11 @@ impl Drop for J2MEEmulator {
 
 impl J2MEEmulator {
     pub fn jar_metadata(jar: &[u8]) -> Result<Option<(String, Option<Vec<u8>>)>> {
-        let files = extract_zip(jar)?;
-        let Some(manifest) = files.get("META-INF/MANIFEST.MF") else {
+        let mut archive = Archive::new(jar)?;
+        let Some(manifest) = archive.read("META-INF/MANIFEST.MF")? else {
             return Ok(None);
         };
-        let descriptor = J2MEDescriptor::parse(manifest);
+        let descriptor = J2MEDescriptor::parse(&manifest);
 
         if descriptor.name.is_empty() || descriptor.main_class_name.is_empty() {
             return Ok(None);
@@ -41,7 +41,7 @@ impl J2MEEmulator {
         let icon = if descriptor.icon.is_empty() {
             None
         } else {
-            files.get(descriptor.icon.trim_start_matches('/')).cloned()
+            archive.read(descriptor.icon.trim_start_matches('/'))?
         };
 
         Ok(Some((descriptor.name, icon)))

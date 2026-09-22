@@ -12,7 +12,7 @@ use wie_jvm_support::JvmSupport;
 use wie_util::{Result, WieError, write_generic};
 
 use crate::{
-    adf::{KtfAdf, find_client_bin},
+    adf::KtfAdf,
     runtime::{KtfJvmSupport, KtfJvmThreadContext},
 };
 
@@ -145,7 +145,7 @@ impl KtfEmulator {
     }
 
     pub fn loadable_jar(jar: &[u8]) -> bool {
-        find_client_bin(jar).is_ok()
+        wie_backend::Archive::new(jar).is_ok_and(|archive| archive.names().any(|name| name.starts_with("client.bin")))
     }
 
     fn load(
