@@ -225,7 +225,7 @@ impl Emulator for KtfEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick().map_err(|x| {
             let reg_stack = self.core.dump_reg_stack(IMAGE_BASE);
             match x {

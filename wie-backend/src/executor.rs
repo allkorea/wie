@@ -142,7 +142,7 @@ impl Executor {
     }
 
     // TODO we need to remove error handling from here. we need to JoinHandle like on spawn..
-    pub fn tick<T, B>(&mut self, now: T, budget_now: B) -> Result<()>
+    pub fn tick<T, B>(&mut self, now: T, budget_now: B) -> Result<bool>
     where
         T: Fn() -> Instant,
         B: Fn() -> u64,
@@ -150,7 +150,14 @@ impl Executor {
         let started = budget_now();
         loop {
             if budget_now().saturating_sub(started) >= 8 {
-                break;
+                let now = now();
+                let inner = self.inner.lock();
+                return Ok(!inner.stopped
+                    && self.wake.0.load(Ordering::Acquire)
+                    && inner
+                        .tasks
+                        .keys()
+                        .any(|id| inner.sleeping_tasks.get(id).is_none_or(|until| *until <= now)));
             }
             let now = now();
 
@@ -175,7 +182,7 @@ impl Executor {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub fn current_task_id(&self) -> u64 {
@@ -310,7 +317,7 @@ mod tests {
                 .await;
             });
             let epoch = Cell::new(1000);
-            executor
+            let yielded = executor
                 .tick(
                     || {
                         if backwards {
@@ -321,8 +328,10 @@ mod tests {
                     advancing_budget(),
                 )
                 .unwrap();
+            assert!(yielded);
             assert_eq!(polls.load(Ordering::Relaxed), 7);
             executor.shutdown();
+            assert!(!executor.tick(advancing_clock(1000), advancing_budget()).unwrap());
         }
     }
 
@@ -341,11 +350,45 @@ mod tests {
                 })
                 .await;
             });
-            executor.tick(advancing_clock(0), advancing_budget()).unwrap();
+            assert!(!executor.tick(advancing_clock(0), advancing_budget()).unwrap());
             assert_eq!(polls.load(Ordering::Relaxed), wakes + 1);
-            executor.tick(advancing_clock(100), advancing_budget()).unwrap();
+            assert!(!executor.tick(advancing_clock(100), advancing_budget()).unwrap());
             assert_eq!(polls.load(Ordering::Relaxed), wakes + 2);
         }
+    }
+
+    #[test]
+    fn continuation_requires_work_that_is_ready_at_the_budget_boundary() {
+        for timeout in [0, 100] {
+            let mut executor = Executor::new();
+            let sleeper = executor.clone();
+            executor.spawn(move || async move {
+                crate::task::SleepFuture::new(timeout, &sleeper).await;
+            });
+            let budget = Cell::new(0);
+            let yielded = executor
+                .tick(
+                    || Instant::from_epoch_millis(0),
+                    || {
+                        let now = budget.get();
+                        budget.set(now + 4);
+                        now
+                    },
+                )
+                .unwrap();
+            assert_eq!(yielded, timeout == 0);
+            assert!(!executor.tick(advancing_clock(100), advancing_budget()).unwrap());
+        }
+
+        let mut executor = Executor::new();
+        executor.spawn(|| async {
+            poll_fn(|cx| {
+                cx.waker().wake_by_ref();
+                Poll::Ready(())
+            })
+            .await;
+        });
+        assert!(!executor.tick(advancing_clock(0), advancing_budget()).unwrap());
     }
 
     #[test]

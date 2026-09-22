@@ -336,9 +336,10 @@ impl WieWeb {
         result.map_err(|e| JsError::new(&e.to_string()))
     }
 
-    pub fn update(&mut self) -> Result<(), JsError> {
+    /// True only when another bounded turn can continue runnable guest work.
+    pub fn update(&mut self) -> Result<bool, JsError> {
         if self.has_exited() {
-            return Ok(());
+            return Ok(false);
         }
         if self.should_redraw.load(Ordering::SeqCst) {
             self.emulator.handle_event(Event::Redraw);
@@ -354,14 +355,14 @@ impl WieWeb {
             }
         }
 
-        self.emulator.tick().map_err(|e| JsError::new(&e.to_string()))?;
+        let yielded = self.emulator.tick().map_err(|e| JsError::new(&e.to_string()))?;
         if let Some(error) = self.window.take_error() {
             return Err(JsError::new(&alloc::format!("Canvas paint failed: {error:?}")));
         }
         if let Some(error) = self._audio_player.0.take_error() {
             return Err(JsError::new(&error));
         }
-        Ok(())
+        Ok(yielded && !self.has_exited())
     }
 
     pub fn take_frame(&self) -> bool {

@@ -34,7 +34,8 @@ use wie_util::Result;
 
 pub trait Emulator {
     fn handle_event(&mut self, event: Event);
-    fn tick(&mut self) -> Result<()>;
+    /// Runs a bounded slice; true requests another turn after yielding to the host.
+    fn tick(&mut self) -> Result<bool>;
 }
 
 pub struct ProfileSample {

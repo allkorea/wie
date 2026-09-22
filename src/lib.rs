@@ -249,7 +249,7 @@ fn start(filename: &str, options: Options, midi_device: Option<usize>) -> anyhow
                     }
                 }
 
-                emulator.tick()?
+                emulator.tick()?;
             }
             WindowCallbackEvent::Redraw => emulator.handle_event(Event::Redraw),
             WindowCallbackEvent::Keydown(x) => {

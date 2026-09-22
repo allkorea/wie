@@ -182,7 +182,7 @@ impl Emulator for LgtEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick().map_err(|x| {
             let reg_stack = self.core.dump_reg_stack(0x1000); // TODO: hardcode
             match x {

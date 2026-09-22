@@ -174,7 +174,7 @@ impl Emulator for J2MEEmulator {
         self.system.event_queue().push(event)
     }
 
-    fn tick(&mut self) -> Result<()> {
+    fn tick(&mut self) -> Result<bool> {
         self.system.tick()
     }
 }

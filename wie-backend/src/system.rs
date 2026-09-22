@@ -66,7 +66,8 @@ impl System {
         self.audio.write().shutdown();
     }
 
-    pub fn tick(&mut self) -> Result<()> {
+    /// Returns true when the host budget expired with runnable work remaining.
+    pub fn tick(&mut self) -> Result<bool> {
         let platform = self.platform.clone();
         self.executor.tick(|| platform.now(), || platform.monotonic_millis())
     }
