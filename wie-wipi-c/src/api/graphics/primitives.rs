@@ -304,12 +304,26 @@ mod tests {
     }
 
     fn check_framebuffer_copy<T: PixelType + 'static>() -> Result<()> {
-        let raw: Vec<_> = (0..18).map(|i| T::from_color(Color { a: i * 14, r: i * 13, g: 255 - i * 11, b: i * 9 })).collect();
+        let raw: Vec<_> = (0..18)
+            .map(|i| {
+                T::from_color(Color {
+                    a: i * 14,
+                    r: i * 13,
+                    g: 255 - i * 11,
+                    b: i * 9,
+                })
+            })
+            .collect();
         let source_image = VecImageBuffer::<T>::from_raw(6, 3, raw.clone());
         let mut context = TestContext::new();
         let source = FrameBuffer::from_image(&mut context, &source_image)?;
         let mut expected = ImageBufferCanvas::new(VecImageBuffer::<T>::from_raw(6, 3, raw));
-        let clip = Clip { x: 1, y: 0, width: 4, height: 3 };
+        let clip = Clip {
+            x: 1,
+            y: 0,
+            width: 4,
+            height: 3,
+        };
         expected.draw(1, 1, 5, 2, &source_image, 0, 0, clip);
         super::copy_area(&mut context, &source, 1, 1, 5, 2, 0, 0, clip)?;
         assert_eq!(&*source.image(&mut context)?.raw(), &*expected.image().raw());

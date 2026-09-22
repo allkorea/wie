@@ -580,7 +580,8 @@ where
             for offset in (0..x_end - x_start).step_by(pixels.len()) {
                 let len = (x_end - x_start - offset).min(pixels.len() as i64);
                 let x = if dx > sx { x_end - offset - len } else { x_start + offset };
-                self.image_buffer.read_colors((x - shift_x) as u32, (y - shift_y) as u32, &mut pixels[..len as usize]);
+                self.image_buffer
+                    .read_colors((x - shift_x) as u32, (y - shift_y) as u32, &mut pixels[..len as usize]);
                 self.image_buffer.put_pixels(x as i32, y as i32, len as u32, &pixels[..len as usize]);
             }
         }
@@ -1224,14 +1225,17 @@ mod tests {
             let snapshot = VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw.clone());
             let mut expected = VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw.clone());
             let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::from_raw(520, 3, raw));
-            let clip = Clip { x: 3, y: 0, width: 513, height: 3 };
+            let clip = Clip {
+                x: 3,
+                y: 0,
+                width: 513,
+                height: 3,
+            };
             for y in 0..3 {
                 for x in 3..516 {
                     let source_x = sx + x - dx;
                     let source_y = sy + y - dy;
-                    if x >= dx && x < dx + 520 && y >= dy && y < dy + 3
-                        && (0..520).contains(&source_x) && (0..3).contains(&source_y)
-                    {
+                    if x >= dx && x < dx + 520 && y >= dy && y < dy + 3 && (0..520).contains(&source_x) && (0..3).contains(&source_y) {
                         expected.put_pixel(x, y, snapshot.get_pixel(source_x, source_y));
                     }
                 }

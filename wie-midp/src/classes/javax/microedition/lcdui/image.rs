@@ -431,7 +431,12 @@ mod tests {
         let mut buffer = JavaImageBuffer::<T>::new(jvm, &image).await?;
         let mut reference = wie_backend::canvas::VecImageBuffer::<T>::new(3, 2);
         let colors: Vec<_> = (0..7)
-            .map(|i| Color { a: 255, r: i * 30, g: 255 - i * 30, b: i * 20 })
+            .map(|i| Color {
+                a: 255,
+                r: i * 30,
+                g: 255 - i * 30,
+                b: i * 20,
+            })
             .collect();
         for (x, y, width) in [(1, 0, 2), (-1, -1, 3), (-1, 0, 3), (2, 1, 3), (i32::MAX, 0, 3)] {
             buffer.put_pixels(x, y, width, &colors);
@@ -456,7 +461,10 @@ mod tests {
         let mut row = [color; 258];
         buffer.read_colors(1, 0, &mut row);
         let expected = T::to_color(pixels[0]);
-        assert!(row.iter().all(|c| (c.a, c.r, c.g, c.b) == (expected.a, expected.r, expected.g, expected.b)));
+        assert!(
+            row.iter()
+                .all(|c| (c.a, c.r, c.g, c.b) == (expected.a, expected.r, expected.g, expected.b))
+        );
         Ok(())
     }
 

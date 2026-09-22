@@ -65,7 +65,11 @@ impl Screen for WindowImpl {
         image.copy_rgba(&mut paint.rgba);
         let width = self.width();
         let height = self.height();
-        if paint.frame.as_ref().is_none_or(|(data, _)| data.width() != width || data.height() != height) {
+        if paint
+            .frame
+            .as_ref()
+            .is_none_or(|(data, _)| data.width() != width || data.height() != height)
+        {
             // JS owns this storage; no view into growable WASM memory survives the call.
             let pixels = Uint8ClampedArray::new_with_length(paint.rgba.len() as u32);
             let data = ImageData::new_with_js_u8_clamped_array_and_sh(&pixels, width, height).unwrap();

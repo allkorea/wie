@@ -75,11 +75,7 @@ impl FrameBuffer {
         }
         let (_, row_bytes) = buffer_size(self.0.width, self.0.height, self.0.bpp / 8)?;
         let size = self.0.bpl.checked_mul(self.0.height).ok_or(WieError::AllocationFailure)?;
-        if self.0.bpl < row_bytes
-            || size > MAX_FRAMEBUFFER_BYTES
-            || self.0.width > i32::MAX as u32
-            || self.0.height > i32::MAX as u32
-        {
+        if self.0.bpl < row_bytes || size > MAX_FRAMEBUFFER_BYTES || self.0.width > i32::MAX as u32 || self.0.height > i32::MAX as u32 {
             return Err(WieError::AllocationFailure);
         }
         let address = context.data_ptr(self.0.buf)?;
@@ -113,8 +109,16 @@ impl FrameBuffer {
             return Err(WieError::AllocationFailure);
         }
         Ok(match self.0.bpp {
-            16 => Box::new(VecImageBuffer::<Rgb565Pixel>::from_raw(width, height, self.data(context, x, y, width, height)?)),
-            32 => Box::new(VecImageBuffer::<ArgbPixel>::from_raw(width, height, self.data(context, x, y, width, height)?)),
+            16 => Box::new(VecImageBuffer::<Rgb565Pixel>::from_raw(
+                width,
+                height,
+                self.data(context, x, y, width, height)?,
+            )),
+            32 => Box::new(VecImageBuffer::<ArgbPixel>::from_raw(
+                width,
+                height,
+                self.data(context, x, y, width, height)?,
+            )),
             _ => return Err(WieError::FatalError(format!("Unsupported pixel format: {}", self.0.bpp))),
         })
     }
@@ -195,11 +199,11 @@ mod test {
 
     #[test]
     fn guest_canvas_matches_snapshot_rasterization_with_padded_rows() {
+        use crate::context::WIPICContext;
         use alloc::{boxed::Box, vec};
         use wie_backend::canvas::{ArgbPixel, Canvas, Clip, Color, ImageBufferCanvas, Rgb565Pixel, VecImageBuffer};
         use wie_util::{ByteRead, ByteWrite};
         use wipi_types::wipic::WIPICFramebuffer;
-        use crate::context::WIPICContext;
 
         for bpp in [16, 32] {
             let mut context = TestContext::new();
@@ -211,14 +215,30 @@ mod test {
             for y in 0..3 {
                 context.write_bytes(address + y * stride + row_bytes, &[0xa5]).unwrap();
             }
-            let framebuffer = FrameBuffer(WIPICFramebuffer { width: 65, height: 3, bpl: stride, bpp, buf });
+            let framebuffer = FrameBuffer(WIPICFramebuffer {
+                width: 65,
+                height: 3,
+                bpl: stride,
+                bpp,
+                buf,
+            });
             let mut reference: Box<dyn Canvas> = if bpp == 16 {
                 Box::new(ImageBufferCanvas::new(VecImageBuffer::<Rgb565Pixel>::new(65, 3)))
             } else {
                 Box::new(ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(65, 3)))
             };
-            let clip = Clip { x: 0, y: 0, width: 65, height: 3 };
-            let color = Color { a: 255, r: 231, g: 123, b: 67 };
+            let clip = Clip {
+                x: 0,
+                y: 0,
+                width: 65,
+                height: 3,
+            };
+            let color = Color {
+                a: 255,
+                r: 231,
+                g: 123,
+                b: 67,
+            };
             let source = VecImageBuffer::<ArgbPixel>::from_raw(2, 1, vec![0x80123456, 0xfffedcba]);
             let draw = |canvas: &mut dyn Canvas| {
                 canvas.fill_rect(-1, -1, 70, 5, color, clip);

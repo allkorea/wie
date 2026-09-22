@@ -761,43 +761,41 @@ impl Displayable {
                 }
                 return Ok(());
             }
-        } else {
-            if code == MIDPKeyCode::RIGHT_SOFT_KEY as i32 {
-                if let Some(binding) = command_layout.right {
-                    if event_type == KeyboardEventType::KeyPressed as i32 {
-                        return jvm
-                            .invoke_virtual(
-                                &this,
-                                "javax/microedition/lcdui/Displayable",
-                                "dispatchCommandAt",
-                                "(I)V",
-                                (binding.effective_index,),
-                            )
-                            .await;
-                    }
-                    return Ok(());
-                }
-            } else if code == MIDPKeyCode::LEFT_SOFT_KEY as i32 && !command_layout.remaining.is_empty() {
+        } else if code == MIDPKeyCode::RIGHT_SOFT_KEY as i32 {
+            if let Some(binding) = command_layout.right {
                 if event_type == KeyboardEventType::KeyPressed as i32 {
-                    if command_layout.remaining.len() == 1 {
-                        return jvm
-                            .invoke_virtual(
-                                &this,
-                                "javax/microedition/lcdui/Displayable",
-                                "dispatchCommandAt",
-                                "(I)V",
-                                (command_layout.remaining[0].effective_index,),
-                            )
-                            .await;
-                    }
-                    jvm.put_field(&mut this, "commandMenuOpen", "Z", true).await?;
-                    jvm.put_field(&mut this, "commandMenuIndex", "I", 0).await?;
-                    let _: () = jvm
-                        .invoke_virtual(&this, "javax/microedition/lcdui/Displayable", "requestRepaint", "()V", ())
-                        .await?;
+                    return jvm
+                        .invoke_virtual(
+                            &this,
+                            "javax/microedition/lcdui/Displayable",
+                            "dispatchCommandAt",
+                            "(I)V",
+                            (binding.effective_index,),
+                        )
+                        .await;
                 }
                 return Ok(());
             }
+        } else if code == MIDPKeyCode::LEFT_SOFT_KEY as i32 && !command_layout.remaining.is_empty() {
+            if event_type == KeyboardEventType::KeyPressed as i32 {
+                if command_layout.remaining.len() == 1 {
+                    return jvm
+                        .invoke_virtual(
+                            &this,
+                            "javax/microedition/lcdui/Displayable",
+                            "dispatchCommandAt",
+                            "(I)V",
+                            (command_layout.remaining[0].effective_index,),
+                        )
+                        .await;
+                }
+                jvm.put_field(&mut this, "commandMenuOpen", "Z", true).await?;
+                jvm.put_field(&mut this, "commandMenuIndex", "I", 0).await?;
+                let _: () = jvm
+                    .invoke_virtual(&this, "javax/microedition/lcdui/Displayable", "requestRepaint", "()V", ())
+                    .await?;
+            }
+            return Ok(());
         }
 
         jvm.invoke_virtual(

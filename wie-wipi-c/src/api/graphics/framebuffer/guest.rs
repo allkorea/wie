@@ -29,10 +29,8 @@ struct Pixels<'a> {
 impl Pixels<'_> {
     fn flush_block(&mut self) -> Result<()> {
         if !self.dirty.is_empty() {
-            self.context.write_bytes(
-                self.address + (self.start + self.dirty.start) as u32,
-                &self.bytes[self.dirty.clone()],
-            )?;
+            self.context
+                .write_bytes(self.address + (self.start + self.dirty.start) as u32, &self.bytes[self.dirty.clone()])?;
             self.dirty = 0..0;
         }
         Ok(())
@@ -140,7 +138,9 @@ impl GuestImage<'_> {
 
 impl Drop for GuestImage<'_> {
     fn drop(&mut self) {
-        if !self.finished && let Err(error) = self.pixels.get_mut().finish() {
+        if !self.finished
+            && let Err(error) = self.pixels.get_mut().finish()
+        {
             tracing::error!("Failed to flush framebuffer canvas: {error}");
         }
     }
