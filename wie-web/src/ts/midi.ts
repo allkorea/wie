@@ -249,6 +249,8 @@ export class AudioPlayer {
           this.playbacks.delete(handle);
           return;
         }
+        if (this.paused && state.ctx.state === "running") await state.ctx.suspend();
+        if (this.disposed || this.playbacks.get(handle) !== playback) return;
         if (definition.events.some((event) => event[1] === "midi")) {
           await this.readyMidi(state);
           if (this.disposed || this.playbacks.get(handle) !== playback) return;
