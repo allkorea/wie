@@ -25,7 +25,6 @@ use hashbrown::HashMap;
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_web::MakeConsoleWriter;
 use wasm_bindgen::{JsError, prelude::*};
-use web_sys::HtmlCanvasElement;
 
 use wie_backend::{Archive, Emulator, Event, Font, Instant, KeyCode, Options, Platform, Screen, extract_zip};
 use wie_j2me::J2MEEmulator;
@@ -37,7 +36,7 @@ use self::{
     audio_sink::{AudioPlayer, AudioSink},
     database::DatabaseRepository,
     filesystem::WebFilesystem,
-    window::WindowImpl,
+    window::{Canvas, WindowImpl},
 };
 
 #[wasm_bindgen(module = "/src/ts/clock.ts")]
@@ -92,6 +91,7 @@ struct WieWebPlatform {
     filesystem: WebFilesystem,
     font: Font,
     window: WindowImpl,
+    exited: Arc<AtomicBool>,
 }
 
 // XXX we're on single thread
@@ -99,13 +99,14 @@ unsafe impl Sync for WieWebPlatform {}
 unsafe impl Send for WieWebPlatform {}
 
 impl WieWebPlatform {
-    fn new(window: WindowImpl, font: Font, audio_player: AudioPlayer) -> Self {
+    fn new(window: WindowImpl, font: Font, audio_player: AudioPlayer, exited: Arc<AtomicBool>) -> Self {
         Self {
             audio_player,
             database_repository: DatabaseRepository::new(),
             filesystem: WebFilesystem::new(),
             font,
             window,
+            exited,
         }
     }
 }
@@ -149,36 +150,44 @@ impl Platform for WieWebPlatform {
         tracing::info!("{}", string);
     }
 
-    fn exit(&self) {}
+    fn exit(&self) {
+        self.exited.store(true, Ordering::SeqCst);
+    }
 
     fn vibrate(&self, duration_ms: u64, intensity: u8) {
         if duration_ms == 0 || intensity == 0 {
             return;
         }
 
-        let Some(window) = web_sys::window() else { return };
-        let navigator = window.navigator();
-        if !js_sys::Reflect::has(navigator.as_ref(), &JsValue::from_str("vibrate")).unwrap_or(false) {
-            return;
-        }
         let duration = core::cmp::min(duration_ms, u32::MAX as u64) as u32;
-        navigator.vibrate_with_duration(duration);
+        audio_sink::vibrate(duration as f64, intensity);
     }
 }
 
 #[wasm_bindgen]
 pub struct WieWeb {
     emulator: Box<dyn Emulator>,
-    audio_player: AudioPlayer,
+    // Fields drop in declaration order: runtime shutdown must precede audio disposal.
+    _audio_player: AudioOwner,
     should_redraw: Arc<AtomicBool>,
     key_events: HashMap<KeyCode, f64>,
+    window: WindowImpl,
+    exited: Arc<AtomicBool>,
 }
 
-impl Drop for WieWeb {
+struct AudioOwner(AudioPlayer);
+
+impl Drop for AudioOwner {
     fn drop(&mut self) {
-        // Runtime tasks can retain platform references after the view closes.
-        self.audio_player.dispose();
+        self.0.dispose();
     }
+}
+
+#[wasm_bindgen(js_name = flushStorage)]
+pub async fn flush_storage() -> Result<(), JsValue> {
+    let result = indexed_db_store::flush_writes().await;
+    indexed_db_store::close_core_stores();
+    result
 }
 
 #[wasm_bindgen]
@@ -258,13 +267,14 @@ pub fn extract_app_metadata(filename: &str, buf: &[u8]) -> Result<ImportedAppMet
 #[wasm_bindgen]
 impl WieWeb {
     #[wasm_bindgen(constructor)]
-    pub fn new(filename: &str, buf: &[u8], canvas: HtmlCanvasElement, font_data: Vec<u8>) -> Result<WieWeb, JsError> {
+    pub fn new(filename: &str, buf: &[u8], canvas: Canvas, font_data: Vec<u8>) -> Result<WieWeb, JsError> {
         let audio_player = AudioPlayer::new();
         let result = (|| {
             let should_redraw = Arc::new(AtomicBool::new(true));
-            let window = WindowImpl::new(canvas, should_redraw.clone());
+            let window = WindowImpl::new(canvas, should_redraw.clone()).map_err(|error| anyhow::anyhow!("Cannot create canvas: {error:?}"))?;
+            let exited = Arc::new(AtomicBool::new(false));
             let font = Font::try_from_vec(font_data)?;
-            let platform = Box::new(WieWebPlatform::new(window, font, audio_player.clone()));
+            let platform = Box::new(WieWebPlatform::new(window.clone(), font, audio_player.clone(), exited.clone()));
             let options = Options {
                 enable_gdbserver: false,
                 profile: None,
@@ -313,9 +323,11 @@ impl WieWeb {
 
             anyhow::Ok(Self {
                 emulator,
-                audio_player: audio_player.clone(),
+                _audio_player: AudioOwner(audio_player.clone()),
                 should_redraw,
                 key_events: HashMap::new(),
+                window,
+                exited,
             })
         })();
         if result.is_err() {
@@ -325,6 +337,9 @@ impl WieWeb {
     }
 
     pub fn update(&mut self) -> Result<(), JsError> {
+        if self.has_exited() {
+            return Ok(());
+        }
         if self.should_redraw.load(Ordering::SeqCst) {
             self.emulator.handle_event(Event::Redraw);
             self.should_redraw.store(false, Ordering::SeqCst)
@@ -339,7 +354,19 @@ impl WieWeb {
             }
         }
 
-        self.emulator.tick().map_err(|e| JsError::new(&e.to_string()))
+        self.emulator.tick().map_err(|e| JsError::new(&e.to_string()))?;
+        if let Some(error) = self.window.take_error() {
+            return Err(JsError::new(&alloc::format!("Canvas paint failed: {error:?}")));
+        }
+        Ok(())
+    }
+
+    pub fn take_frame(&self) -> bool {
+        self.window.take_frame()
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::SeqCst)
     }
 
     pub fn key_down(&mut self, key: String) -> Result<(), JsError> {

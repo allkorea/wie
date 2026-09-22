@@ -22,6 +22,8 @@ extern "C" {
 
     #[wasm_bindgen(js_name = setPcmVolume)]
     pub fn set_pcm_volume(value: f32);
+
+    pub fn vibrate(duration: f64, intensity: u8);
 }
 
 pub struct AudioSink {

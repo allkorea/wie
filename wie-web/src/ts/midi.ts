@@ -181,3 +181,6 @@ export class AudioPlayer {
     void this.audioReady.then(state => state?.synth?.destroy());
   }
 }
+export function vibrate(duration: number, intensity: number): void {
+  if (duration > 0 && intensity > 0) globalThis.navigator?.vibrate?.(duration);
+}

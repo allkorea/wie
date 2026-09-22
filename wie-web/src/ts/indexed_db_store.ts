@@ -59,9 +59,10 @@ export function committed<T>(transaction: IDBTransaction, result: () => T): Prom
 
 export async function flushWrites() {
   const owner = generation;
+  const opening = await Promise.allSettled([...stores.values()]);
   const settled = await Promise.allSettled([...writes].filter(([, epoch]) => epoch === owner).map(([write]) => write));
   if (owner !== generation) throw new GameStorageError("게임의 저장 연결이 종료되었습니다.");
-  const failure = settled.find((result) => result.status === "rejected");
+  const failure = [...opening, ...settled].find((result) => result.status === "rejected");
   if (failure?.status === "rejected") writeError ??= failure.reason;
   if (writeError)
     throw new GameStorageError("저장 공간에 기록하지 못했습니다. 저장 공간을 확인한 뒤 다시 실행해 주세요.", {

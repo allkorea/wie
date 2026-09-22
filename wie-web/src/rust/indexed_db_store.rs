@@ -10,6 +10,11 @@ type JsResult<T> = core::result::Result<T, JsValue>;
 
 #[wasm_bindgen(module = "/src/ts/indexed_db_store.ts")]
 extern "C" {
+    #[wasm_bindgen(catch, js_name = flushWrites)]
+    pub async fn flush_writes() -> JsResult<()>;
+    #[wasm_bindgen(js_name = closeCoreStores)]
+    pub fn close_core_stores();
+
     type IndexedDBStore;
 
     #[wasm_bindgen(static_method_of = IndexedDBStore, catch)]
