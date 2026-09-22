@@ -112,6 +112,7 @@ export class IndexedDBStore {
       })
       .catch((error: unknown) => {
         if (stores.get(key) === opening) stores.delete(key);
+        if (owner === generation) writeError ??= error;
         throw error;
       });
     stores.set(key, opening);
