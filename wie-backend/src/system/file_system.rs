@@ -238,6 +238,9 @@ mod tests {
         fn now(&self) -> Instant {
             Instant::from_epoch_millis(0)
         }
+        fn monotonic_millis(&self) -> u64 {
+            unimplemented!()
+        }
         fn database_repository(&self) -> &dyn DatabaseRepository {
             unimplemented!()
         }

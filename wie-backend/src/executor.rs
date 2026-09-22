@@ -142,17 +142,17 @@ impl Executor {
     }
 
     // TODO we need to remove error handling from here. we need to JoinHandle like on spawn..
-    pub fn tick<T>(&mut self, now: T) -> Result<()>
+    pub fn tick<T, B>(&mut self, now: T, budget_now: B) -> Result<()>
     where
         T: Fn() -> Instant,
+        B: Fn() -> u64,
     {
-        let end = now() + 8; // TODO hardcoded
+        let started = budget_now();
         loop {
-            let now = now();
-
-            if now > end {
+            if budget_now().saturating_sub(started) >= 8 {
                 break;
             }
+            let now = now();
 
             {
                 let inner = self.inner.lock();
@@ -290,6 +290,42 @@ mod tests {
         }
     }
 
+    fn advancing_budget() -> impl Fn() -> u64 {
+        let clock = advancing_clock(0);
+        move || clock().raw()
+    }
+
+    #[test]
+    fn host_budget_expires_when_guest_time_is_frozen_or_moves_backwards() {
+        for backwards in [false, true] {
+            let mut executor = Executor::new();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            executor.spawn(move || async move {
+                poll_fn(|cx| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    cx.waker().wake_by_ref();
+                    Poll::<()>::Pending
+                })
+                .await;
+            });
+            let epoch = Cell::new(1000);
+            executor
+                .tick(
+                    || {
+                        if backwards {
+                            epoch.set(epoch.get() - 1);
+                        }
+                        Instant::from_epoch_millis(epoch.get())
+                    },
+                    advancing_budget(),
+                )
+                .unwrap();
+            assert_eq!(polls.load(Ordering::Relaxed), 7);
+            executor.shutdown();
+        }
+    }
+
     #[test]
     fn pending_tasks_only_repeat_within_a_tick_when_woken() {
         for wakes in [0, 2] {
@@ -305,9 +341,9 @@ mod tests {
                 })
                 .await;
             });
-            executor.tick(advancing_clock(0)).unwrap();
+            executor.tick(advancing_clock(0), advancing_budget()).unwrap();
             assert_eq!(polls.load(Ordering::Relaxed), wakes + 1);
-            executor.tick(advancing_clock(100)).unwrap();
+            executor.tick(advancing_clock(100), advancing_budget()).unwrap();
             assert_eq!(polls.load(Ordering::Relaxed), wakes + 2);
         }
     }
@@ -361,7 +397,7 @@ mod tests {
                 observed.store(true, Ordering::Relaxed);
             });
         });
-        executor.tick(advancing_clock(0)).unwrap();
+        executor.tick(advancing_clock(0), advancing_budget()).unwrap();
         assert!(completed.load(Ordering::Relaxed));
     }
 
@@ -378,10 +414,10 @@ mod tests {
             completed_clone.store(true, Ordering::Relaxed);
         });
 
-        assert!(executor.tick(advancing_clock(0)).is_err());
+        assert!(executor.tick(advancing_clock(0), advancing_budget()).is_err());
         assert!(!completed.load(Ordering::Relaxed));
 
-        executor.tick(advancing_clock(100)).unwrap();
+        executor.tick(advancing_clock(100), advancing_budget()).unwrap();
         assert!(completed.load(Ordering::Relaxed));
     }
 
@@ -400,13 +436,13 @@ mod tests {
 
         executor.spawn(|| async { Err::<(), _>(WieError::FatalError("test error".into())) });
 
-        assert!(executor.tick(advancing_clock(0)).is_err());
+        assert!(executor.tick(advancing_clock(0), advancing_budget()).is_err());
         assert!(!completed.load(Ordering::Relaxed));
 
-        executor.tick(advancing_clock(50)).unwrap();
+        executor.tick(advancing_clock(50), advancing_budget()).unwrap();
         assert!(!completed.load(Ordering::Relaxed));
 
-        executor.tick(advancing_clock(200)).unwrap();
+        executor.tick(advancing_clock(200), advancing_budget()).unwrap();
         assert!(completed.load(Ordering::Relaxed));
     }
 
@@ -427,7 +463,7 @@ mod tests {
             completed_b_clone.store(true, Ordering::Relaxed);
         });
 
-        executor.tick(advancing_clock(0)).unwrap();
+        executor.tick(advancing_clock(0), advancing_budget()).unwrap();
 
         assert!(completed_a.load(Ordering::Relaxed));
         assert!(completed_b.load(Ordering::Relaxed));
@@ -457,7 +493,7 @@ mod tests {
                 core::future::pending::<()>().await;
                 drop(guard);
             });
-            executor.tick(advancing_clock(0)).unwrap();
+            executor.tick(advancing_clock(0), advancing_budget()).unwrap();
             executor.shutdown();
             executor.shutdown();
             assert_eq!(drops.load(Ordering::Relaxed), 1);

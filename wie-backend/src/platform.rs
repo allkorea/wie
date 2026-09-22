@@ -6,6 +6,8 @@ pub trait Platform: Send + Sync {
     fn font(&self) -> &Font;
     fn screen(&self) -> &dyn Screen;
     fn now(&self) -> Instant;
+    /// Host execution budget clock, in milliseconds; advances even while guest time is paused.
+    fn monotonic_millis(&self) -> u64;
     fn database_repository(&self) -> &dyn DatabaseRepository;
     fn filesystem(&self) -> &dyn Filesystem;
     fn audio_sink(&self) -> Box<dyn AudioSink>;

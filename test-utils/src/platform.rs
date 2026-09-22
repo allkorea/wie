@@ -14,6 +14,7 @@ use wie_util::Result;
 use crate::filesystem::MemoryFilesystem;
 
 static TEST_EPOCH: AtomicU64 = AtomicU64::new(0);
+static TEST_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Default)]
 pub struct TestClock {
@@ -112,6 +113,10 @@ impl Platform for TestPlatform {
 
     fn database_repository(&self) -> &dyn DatabaseRepository {
         self.db.as_ref()
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        TEST_BUDGET.fetch_add(1, Ordering::Relaxed)
     }
 
     fn filesystem(&self) -> &dyn Filesystem {

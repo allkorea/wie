@@ -40,6 +40,14 @@ use self::{
     window::WindowImpl,
 };
 
+#[wasm_bindgen(module = "/src/ts/clock.ts")]
+extern "C" {
+    #[wasm_bindgen(js_name = epochMillis)]
+    fn epoch_millis() -> f64;
+    #[wasm_bindgen(js_name = monotonicMillis)]
+    fn monotonic_millis() -> f64;
+}
+
 enum ArchivePlatform {
     Ktf,
     Lgt,
@@ -108,10 +116,11 @@ impl Platform for WieWebPlatform {
     }
 
     fn now(&self) -> Instant {
-        let date = js_sys::Date::new_0();
-        let millis = date.value_of();
+        Instant::from_epoch_millis(epoch_millis() as u64)
+    }
 
-        Instant::from_epoch_millis(millis as _)
+    fn monotonic_millis(&self) -> u64 {
+        monotonic_millis() as u64
     }
 
     fn database_repository(&self) -> &dyn wie_backend::DatabaseRepository {
@@ -301,8 +310,7 @@ impl WieWeb {
             self.should_redraw.store(false, Ordering::SeqCst)
         }
 
-        let date = js_sys::Date::new_0();
-        let millis = date.value_of();
+        let millis = epoch_millis();
 
         for (key, key_millis) in self.key_events.iter_mut() {
             if millis - *key_millis > 100.0 {
@@ -315,8 +323,7 @@ impl WieWeb {
     }
 
     pub fn key_down(&mut self, key: String) -> Result<(), JsError> {
-        let date = js_sys::Date::new_0();
-        let millis = date.value_of();
+        let millis = epoch_millis();
         let key = KeyCode::parse(&key);
 
         self.emulator.handle_event(Event::Keydown(key));

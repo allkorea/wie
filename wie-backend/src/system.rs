@@ -68,7 +68,7 @@ impl System {
 
     pub fn tick(&mut self) -> Result<()> {
         let platform = self.platform.clone();
-        self.executor.tick(move || platform.now())
+        self.executor.tick(|| platform.now(), || platform.monotonic_millis())
     }
 
     pub fn spawn<C>(&self, callable: C)
