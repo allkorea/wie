@@ -1,8 +1,13 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use directories::ProjectDirs;
 
 use wie_backend::RecordId;
+use wie_util::{Result, WieError};
+
+fn storage_error(error: std::io::Error) -> WieError {
+    WieError::FatalError(format!("database: {error}"))
+}
 
 pub struct DatabaseRepository {
     base_path: PathBuf,
@@ -45,59 +50,50 @@ impl DatabaseRepository {
         self.get_path_for_database("_", app_id).parent().unwrap().to_owned()
     }
 
-    fn directory_usage(path: &std::path::Path) -> u64 {
-        let Ok(entries) = fs::read_dir(path) else {
-            return 0;
+    fn directory_usage(path: &std::path::Path) -> Result<u64> {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(storage_error(error)),
         };
-
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| {
-                let Ok(file_type) = entry.file_type() else {
-                    return 0;
-                };
-                if file_type.is_file() {
-                    entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
-                } else if file_type.is_dir() {
-                    Self::directory_usage(&entry.path())
-                } else {
-                    0
-                }
-            })
-            .sum()
+        let mut usage: u64 = 0;
+        for entry in entries {
+            let entry = entry.map_err(storage_error)?;
+            let file_type = entry.file_type().map_err(storage_error)?;
+            let size = if file_type.is_file() {
+                entry.metadata().map_err(storage_error)?.len()
+            } else if file_type.is_dir() {
+                Self::directory_usage(&entry.path())?
+            } else {
+                0
+            };
+            usage = usage
+                .checked_add(size)
+                .ok_or_else(|| WieError::FatalError("database usage overflow".into()))?;
+        }
+        Ok(usage)
     }
 }
 
 #[async_trait::async_trait]
 impl wie_backend::DatabaseRepository for DatabaseRepository {
-    async fn open(&self, name: &str, app_id: &str) -> Box<dyn wie_backend::Database> {
-        let path = self.get_path_for_database(name, app_id);
-
-        Box::new(Database::new(path).unwrap())
+    async fn open(&self, name: &str, app_id: &str) -> Result<Box<dyn wie_backend::Database>> {
+        Ok(Box::new(Database::new(self.get_path_for_database(name, app_id)).map_err(storage_error)?))
     }
 
-    async fn exists(&self, name: &str, app_id: &str) -> bool {
-        let path = self.get_path_for_database(name, app_id);
-
-        path.exists()
+    async fn exists(&self, name: &str, app_id: &str) -> Result<bool> {
+        self.get_path_for_database(name, app_id).try_exists().map_err(storage_error)
     }
 
-    async fn delete(&self, name: &str, app_id: &str) -> bool {
-        let path = self.get_path_for_database(name, app_id);
-
-        tracing::trace!("Delete database at {path:?}");
-
-        match fs::remove_dir_all(path) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => {
-                tracing::warn!("Failed to delete database: {e}");
-                false
-            }
+    async fn delete(&self, name: &str, app_id: &str) -> Result<bool> {
+        match fs::remove_dir_all(self.get_path_for_database(name, app_id)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(storage_error(error)),
         }
     }
 
-    async fn usage(&self, app_id: &str) -> u64 {
+    async fn usage(&self, app_id: &str) -> Result<u64> {
         Self::directory_usage(&self.get_path_for_app_databases(app_id))
     }
 }
@@ -107,27 +103,21 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(base_path: PathBuf) -> anyhow::Result<Self> {
-        tracing::trace!("Opening database at {base_path:?}");
-
+    pub fn new(base_path: PathBuf) -> std::io::Result<Self> {
         fs::create_dir_all(&base_path)?;
-
         Ok(Self { base_path })
     }
 
-    fn find_empty_record_id(&self) -> RecordId {
-        let mut record_id = 1; // XXX midp requires first record to be 1
-
-        loop {
-            let path = self.base_path.join(record_id.to_string());
-
-            if !path.exists() {
-                return record_id;
-            }
-
-            record_id += 1;
+    fn find_empty_record_id(&self) -> Result<RecordId> {
+        let mut record_id: RecordId = 1;
+        while self.get_path_for_record(record_id).try_exists().map_err(storage_error)? {
+            record_id = record_id
+                .checked_add(1)
+                .ok_or_else(|| WieError::FatalError("record IDs exhausted".into()))?;
         }
+        Ok(record_id)
     }
+
     fn get_path_for_record(&self, id: RecordId) -> PathBuf {
         self.base_path.join(id.to_string())
     }
@@ -135,51 +125,61 @@ impl Database {
 
 #[async_trait::async_trait]
 impl wie_backend::Database for Database {
-    async fn next_id(&self) -> RecordId {
+    async fn next_id(&self) -> Result<RecordId> {
         self.find_empty_record_id()
     }
 
-    async fn add(&mut self, data: &[u8]) -> RecordId {
-        let id = self.find_empty_record_id();
-
-        tracing::trace!("Adding record {id} to database {:?}", &self.base_path);
-
-        let path = self.get_path_for_record(id);
-        fs::write(path, data).unwrap();
-
-        id
+    async fn add(&mut self, data: &[u8]) -> Result<RecordId> {
+        let mut id = self.find_empty_record_id()?;
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(self.get_path_for_record(id)) {
+                Ok(mut file) => {
+                    file.write_all(data).map_err(storage_error)?;
+                    return Ok(id);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    id = id.checked_add(1).ok_or_else(|| WieError::FatalError("record IDs exhausted".into()))?;
+                }
+                Err(error) => return Err(storage_error(error)),
+            }
+        }
     }
 
-    async fn get(&self, id: RecordId) -> Option<Vec<u8>> {
-        let path = self.get_path_for_record(id);
-
-        tracing::trace!("Read record {id} from database {:?}", &self.base_path);
-
-        fs::read(path).ok()
+    async fn get(&self, id: RecordId) -> Result<Option<Vec<u8>>> {
+        match fs::read(self.get_path_for_record(id)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(storage_error(error)),
+        }
     }
 
-    async fn set(&mut self, id: RecordId, data: &[u8]) -> bool {
-        let path = self.get_path_for_record(id);
-
-        tracing::trace!("Set record {id} to database {:?}", &self.base_path);
-
-        fs::write(path, data).is_ok()
+    async fn set(&mut self, id: RecordId, data: &[u8]) -> Result<bool> {
+        fs::write(self.get_path_for_record(id), data).map_err(storage_error)?;
+        Ok(true)
     }
 
-    async fn delete(&mut self, id: RecordId) -> bool {
-        let path = self.get_path_for_record(id);
-
-        tracing::trace!("Delete record {id} from database {:?}", &self.base_path);
-
-        fs::remove_file(path).is_ok()
+    async fn delete(&mut self, id: RecordId) -> Result<bool> {
+        match fs::remove_file(self.get_path_for_record(id)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(storage_error(error)),
+        }
     }
 
-    async fn get_record_ids(&self) -> Vec<RecordId> {
-        fs::read_dir(&self.base_path)
-            .unwrap()
-            .filter(|x| x.as_ref().unwrap().path().is_file())
-            .map(|x| x.unwrap().file_name().to_str().unwrap().parse().unwrap())
-            .collect()
+    async fn get_record_ids(&self) -> Result<Vec<RecordId>> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.base_path).map_err(storage_error)? {
+            let entry = entry.map_err(storage_error)?;
+            if entry.file_type().map_err(storage_error)?.is_file() {
+                let id = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                    .ok_or_else(|| WieError::FatalError("invalid record filename".into()))?;
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 }
 

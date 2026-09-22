@@ -1,4 +1,4 @@
-use alloc::{borrow::ToOwned, boxed::Box, vec, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, string::ToString, vec, vec::Vec};
 
 use bytemuck::cast_vec;
 
@@ -79,7 +79,7 @@ impl RecordStore {
 
         let data: Vec<i8> = jvm.load_array(&data, offset as _, length as _).await?;
 
-        let id = database.add(&cast_vec(data)).await;
+        let id = Self::storage_result(jvm, database.add(&cast_vec(data)).await).await?;
 
         Ok(id as _)
     }
@@ -88,7 +88,7 @@ impl RecordStore {
         tracing::debug!("javax.microedition.rms.RecordStore::deleteRecord({this:?}, {record_id})");
 
         let mut database = Self::get_database(jvm, context, &this).await?;
-        if !database.delete(record_id as _).await {
+        if !Self::storage_result(jvm, database.delete(record_id as _).await).await? {
             return Err(jvm.exception("javax/microedition/rms/InvalidRecordIDException", "Record not found").await);
         }
 
@@ -106,7 +106,7 @@ impl RecordStore {
 
         let database = Self::get_database(jvm, context, &this).await?;
 
-        let next_id = database.next_id().await;
+        let next_id = Self::storage_result(jvm, database.next_id().await).await?;
 
         Ok(next_id as _)
     }
@@ -121,7 +121,7 @@ impl RecordStore {
 
         let database = Self::get_database(jvm, context, &this).await?;
 
-        let result = database.get(record_id as _).await;
+        let result = Self::storage_result(jvm, database.get(record_id as _).await).await?;
         if result.is_none() {
             return Err(jvm.exception("javax/microedition/rms/InvalidRecordIDException", "Record not found").await);
         }
@@ -146,7 +146,7 @@ impl RecordStore {
 
         let database = Self::get_database(jvm, context, &this).await?;
 
-        let result = database.get(record_id as _).await;
+        let result = Self::storage_result(jvm, database.get(record_id as _).await).await?;
         if result.is_none() {
             return Err(jvm.exception("javax/microedition/rms/InvalidRecordIDException", "Record not found").await);
         }
@@ -163,7 +163,7 @@ impl RecordStore {
 
         let database = Self::get_database(jvm, context, &this).await?;
 
-        let result = database.get(record_id as _).await;
+        let result = Self::storage_result(jvm, database.get(record_id as _).await).await?;
         if result.is_none() {
             return Err(jvm.exception("javax/microedition/rms/InvalidRecordIDException", "Record not found").await);
         }
@@ -187,7 +187,7 @@ impl RecordStore {
         let data: Vec<i8> = jvm.load_array(&data, offset as _, length as _).await?;
 
         let mut database = Self::get_database(jvm, context, &this).await?;
-        database.set(record_id as _, &cast_vec(data)).await;
+        Self::storage_result(jvm, database.set(record_id as _, &cast_vec(data)).await).await?;
 
         Ok(())
     }
@@ -197,7 +197,7 @@ impl RecordStore {
 
         let database = Self::get_database(jvm, context, &this).await?;
 
-        let count = database.get_record_ids().await.len();
+        let count = Self::storage_result(jvm, database.get_record_ids().await).await?.len();
 
         Ok(count as _)
     }
@@ -237,6 +237,13 @@ impl RecordStore {
         Ok(result.into())
     }
 
+    async fn storage_result<T>(jvm: &Jvm, result: wie_util::Result<T>) -> JvmResult<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => Err(jvm.exception("javax/microedition/rms/RecordStoreException", &error.to_string()).await),
+        }
+    }
+
     async fn get_database(jvm: &Jvm, context: &mut WieJvmContext, this: &ClassInstanceRef<Self>) -> JvmResult<Box<dyn Database>> {
         let db_name = jvm.get_field(this, "dbName", "Ljava/lang/String;").await?;
         let db_name_str = JavaLangString::to_rust_string(jvm, &db_name).await?;
@@ -244,7 +251,7 @@ impl RecordStore {
         let system = context.system();
         let pid = system.pid().to_owned();
 
-        Ok(system.platform().database_repository().open(&db_name_str, &pid).await)
+        Self::storage_result(jvm, system.platform().database_repository().open(&db_name_str, &pid).await).await
     }
 }
 

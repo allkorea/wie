@@ -101,7 +101,7 @@ impl WIPICContext for LgtWIPICContext {
         }
         self.jvm.collect_garbage().unwrap();
 
-        Ok(self.system.filesystem().size(name).await)
+        self.system.filesystem().size(name).await
     }
 
     async fn read_resource(&self, name: &str) -> Result<Vec<u8>> {
@@ -112,11 +112,11 @@ impl WIPICContext for LgtWIPICContext {
             return Ok(JavaIoInputStream::read_until_end(&self.jvm, &stream).await.unwrap());
         }
 
-        let Some(size) = self.system.filesystem().size(name).await else {
+        let Some(size) = self.system.filesystem().size(name).await? else {
             return Err(WieError::FatalError(format!("Missing resource: {name}")));
         };
         let mut data = vec![0; size];
-        let read = self.system.filesystem().read(name, 0, size, &mut data).await.unwrap_or(0);
+        let read = self.system.filesystem().read(name, 0, size, &mut data).await?.unwrap_or(0);
         data.truncate(read);
 
         self.jvm.collect_garbage().unwrap();

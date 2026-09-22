@@ -16,17 +16,17 @@ pub struct FileImpl {
 impl FileImpl {
     pub async fn new(system: System, path: &str, options: FileOpenOptions) -> Result<Self, IOError> {
         let filesystem = system.filesystem();
-        let exists = filesystem.exists(path).await;
+        let exists = filesystem.exists(path).await.map_err(|_| IOError::Io)?;
         if !exists && !options.create {
             return Err(IOError::NotFound);
         }
 
-        if (options.truncate || !exists) && !filesystem.truncate(path, 0).await {
-            return Err(IOError::Io);
+        if options.truncate || !exists {
+            filesystem.truncate(path, 0).await.map_err(|_| IOError::Io)?;
         }
 
         let cursor = if options.append {
-            filesystem.size(path).await.ok_or(IOError::NotFound)? as u64
+            filesystem.size(path).await.map_err(|_| IOError::Io)?.ok_or(IOError::NotFound)? as u64
         } else {
             0
         };
@@ -47,10 +47,14 @@ impl File for FileImpl {
             return Err(IOError::Unsupported);
         }
 
-        let cursor = self.cursor.load(Ordering::SeqCst) as usize;
+        let cursor = usize::try_from(self.cursor.load(Ordering::SeqCst)).map_err(|_| IOError::Io)?;
         let fs = self.system.filesystem();
 
-        let read = fs.read(&self.path, cursor, buf.len(), buf).await.ok_or(IOError::NotFound)?;
+        let read = fs
+            .read(&self.path, cursor, buf.len(), buf)
+            .await
+            .map_err(|_| IOError::Io)?
+            .ok_or(IOError::NotFound)?;
 
         self.cursor.fetch_add(read as u64, Ordering::SeqCst);
 
@@ -64,11 +68,11 @@ impl File for FileImpl {
 
         let filesystem = self.system.filesystem();
         let cursor = if self.options.append {
-            filesystem.size(&self.path).await.ok_or(IOError::NotFound)?
+            filesystem.size(&self.path).await.map_err(|_| IOError::Io)?.ok_or(IOError::NotFound)?
         } else {
-            self.cursor.load(Ordering::SeqCst) as usize
+            usize::try_from(self.cursor.load(Ordering::SeqCst)).map_err(|_| IOError::Io)?
         };
-        let written = filesystem.write(&self.path, cursor, buf).await;
+        let written = filesystem.write(&self.path, cursor, buf).await.map_err(|_| IOError::Io)?;
         if written != buf.len() {
             return Err(IOError::Io);
         }
@@ -93,15 +97,23 @@ impl File for FileImpl {
             return Err(IOError::Unsupported);
         }
 
-        if !self.system.filesystem().truncate(&self.path, len as usize).await {
-            return Err(IOError::Io);
-        }
+        self.system
+            .filesystem()
+            .truncate(&self.path, usize::try_from(len).map_err(|_| IOError::Io)?)
+            .await
+            .map_err(|_| IOError::Io)?;
 
         Ok(())
     }
 
     async fn metadata(&self) -> IOResult<FileStat> {
-        let size = self.system.filesystem().size(&self.path).await.ok_or(IOError::NotFound)?;
+        let size = self
+            .system
+            .filesystem()
+            .size(&self.path)
+            .await
+            .map_err(|_| IOError::Io)?
+            .ok_or(IOError::NotFound)?;
 
         Ok(FileStat {
             size: size as _,

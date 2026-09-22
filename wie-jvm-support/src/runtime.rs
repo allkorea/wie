@@ -230,7 +230,13 @@ where
             });
         }
 
-        let size = self.system.filesystem().size(path).await.ok_or(IOError::NotFound)?;
+        let size = self
+            .system
+            .filesystem()
+            .size(path)
+            .await
+            .map_err(|_| IOError::Io)?
+            .ok_or(IOError::NotFound)?;
 
         Ok(FileStat {
             size: size as _,
